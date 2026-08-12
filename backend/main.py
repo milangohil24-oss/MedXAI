@@ -105,19 +105,32 @@ app = FastAPI(
 # CORS
 # ============================================================
 
-frontend_url = os.getenv("FRONTEND_URL", "https://medxai-frontend.onrender.com").strip().rstrip("/")
-configured_origins = os.getenv("CORS_ORIGINS", "").strip()
+# ============================================================
+# CORS CONFIGURATION
+# ============================================================
+
+frontend_url = os.getenv(
+    "FRONTEND_URL",
+    "https://medxai-frontend.onrender.com"
+).strip().rstrip("/")
+
+configured_origins = os.getenv(
+    "CORS_ORIGINS",
+    ""
+).strip()
 
 origins = [
+    # Production frontend
     frontend_url,
+
+    # Local development
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "http://localhost:8000",
-    "http://127.0.0.1:8000",
 ]
 
+# Add optional origins from Render environment variable
 if configured_origins:
     origins.extend(
         origin.strip().rstrip("/")
@@ -125,19 +138,28 @@ if configured_origins:
         if origin.strip()
     )
 
-# Remove duplicates while preserving order.
+# Remove duplicates while preserving order
 origins = list(dict.fromkeys(origins))
+
+print("CORS allowed origins:", origins)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_origin_regex=r"^https://([a-zA-Z0-9-]+\.)?onrender\.com$|^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=[
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "OPTIONS",
+    ],
     allow_headers=["*"],
+    expose_headers=[
+        "Content-Disposition",
+    ],
 )
-
-
 # ============================================================
 # DIRECTORIES
 # ============================================================
