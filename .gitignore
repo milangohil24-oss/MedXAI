@@ -1,0 +1,36 @@
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Node
+node_modules/
+
+# Frontend build
+dist/
+build/
+
+# Runtime files
+uploads/*
+reports/*
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
