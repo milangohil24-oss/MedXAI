@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-const API_URL = "http://127.0.0.1:8000";
+const API_URL = import.meta.env.VITE_API_BASE_URL || "https://medxai-backend.onrender.com";
 
 interface Analysis {
   id: string;

@@ -7,32 +7,60 @@ import {
 
 import type { ReactNode } from "react";
 import type { User } from "../types";
+
 import { api } from "../services/api";
 
+
+// ============================================================
+// TYPES
+// ============================================================
+
+type Role =
+  | "doctor"
+  | "patient";
+
+
 interface AuthContextType {
+
   user: User | null;
+
   loading: boolean;
 
   login: (
     email: string,
     password: string,
-    role?: "doctor" | "patient"
+    role?: Role
   ) => Promise<void>;
 
   register: (
     name: string,
     email: string,
-    password: string
+    password: string,
+    role?: Role
   ) => Promise<void>;
 
   logout: () => Promise<void>;
 }
 
-const AuthContext = createContext<
-  AuthContextType | undefined
->(undefined);
 
-function extractToken(data: any): string | null {
+// ============================================================
+// CONTEXT
+// ============================================================
+
+const AuthContext =
+  createContext<
+    AuthContextType | undefined
+  >(undefined);
+
+
+// ============================================================
+// TOKEN EXTRACTION
+// ============================================================
+
+function extractToken(
+  data: any
+): string | null {
+
   return (
     data?.access_token ??
     data?.token ??
@@ -44,89 +72,162 @@ function extractToken(data: any): string | null {
   );
 }
 
+
+// ============================================================
+// USER EXTRACTION
+// ============================================================
+
 function extractUser(
   response: any,
   email: string,
-  role: "doctor" | "patient"
+  role: Role
 ): User {
-  return (
+
+  const serverUser =
     response?.user ??
-    response?.data?.user ?? {
-      id: response?.id ?? "",
-      name:
-        response?.name ??
-        response?.data?.name ??
-        (role === "doctor"
+    response?.data?.user;
+
+  if (serverUser) {
+
+    return {
+      ...serverUser,
+      email:
+        serverUser.email ??
+        email,
+      role:
+        serverUser.role ??
+        role,
+    };
+  }
+
+  return {
+    id:
+      response?.id ??
+      response?.data?.id ??
+      "",
+
+    name:
+      response?.name ??
+      response?.data?.name ??
+      (
+        role === "doctor"
           ? "Dr. Researcher"
-          : "Patient"),
-      email,
-      role,
-    }
-  );
+          : "Patient"
+      ),
+
+    email,
+
+    role,
+  };
 }
+
+
+// ============================================================
+// PROVIDER
+// ============================================================
 
 export function AuthProvider({
   children,
 }: {
   children: ReactNode;
 }) {
-  const [user, setUser] =
-    useState<User | null>(null);
 
-  const [loading, setLoading] =
-    useState(true);
+  const [
+    user,
+    setUser
+  ] = useState<User | null>(
+    null
+  );
+
+  const [
+    loading,
+    setLoading
+  ] = useState(true);
+
+
+  // ==========================================================
+  // RESTORE SESSION
+  // ==========================================================
 
   useEffect(() => {
+
     const token =
-      localStorage.getItem("medxai_token");
+      localStorage.getItem(
+        "medxai_token"
+      );
 
     const savedUser =
-      localStorage.getItem("medxai_user");
+      localStorage.getItem(
+        "medxai_user"
+      );
 
-    if (token && savedUser) {
+    if (
+      token &&
+      savedUser
+    ) {
+
       try {
-        const parsedUser = JSON.parse(
-          savedUser
+
+        const parsedUser =
+          JSON.parse(
+            savedUser
+          );
+
+        setUser(
+          parsedUser
         );
 
-        setUser(parsedUser);
       } catch {
+
         localStorage.removeItem(
           "medxai_user"
         );
+
         localStorage.removeItem(
           "medxai_token"
         );
+
       }
+
     }
 
     setLoading(false);
+
   }, []);
+
+
+  // ==========================================================
+  // LOGIN
+  // ==========================================================
 
   async function login(
     email: string,
     password: string,
-    role: "doctor" | "patient" = "doctor"
+    role: Role = "patient"
   ) {
+
     const response =
-      role === "doctor"
-        ? await api.doctorLogin({
-            email,
-            password,
-          })
-        : await api.patientLogin({
-            email,
-            password,
-          });
+      await api.login({
+        email,
+        password,
+        role,
+      });
+
 
     const token =
-      extractToken(response);
+      extractToken(
+        response
+      );
+
 
     if (!token) {
+
       throw new Error(
         "Login succeeded but the server did not return an authentication token."
       );
+
     }
+
 
     const loggedUser =
       extractUser(
@@ -135,63 +236,107 @@ export function AuthProvider({
         role
       );
 
+
     localStorage.setItem(
       "medxai_token",
       token
     );
 
+
     localStorage.setItem(
       "medxai_user",
-      JSON.stringify(loggedUser)
+      JSON.stringify(
+        loggedUser
+      )
     );
 
-    setUser(loggedUser);
+
+    setUser(
+      loggedUser
+    );
   }
+
+
+  // ==========================================================
+  // REGISTER
+  // ==========================================================
 
   async function register(
     name: string,
     email: string,
-    password: string
+    password: string,
+    role: Role = "patient"
   ) {
+
     const response =
       await api.register({
         name,
         email,
         password,
-        role: "doctor",
+        role,
       });
 
-    const token =
-      extractToken(response);
 
-    if (token) {
-      localStorage.setItem(
-        "medxai_token",
-        token
+    const token =
+      extractToken(
+        response
       );
+
+
+    if (!token) {
+
+      throw new Error(
+        "Registration succeeded but the server did not return an authentication token."
+      );
+
     }
+
 
     const registeredUser =
       extractUser(
         response,
         email,
-        "doctor"
+        role
       );
+
+
+    localStorage.setItem(
+      "medxai_token",
+      token
+    );
+
 
     localStorage.setItem(
       "medxai_user",
-      JSON.stringify(registeredUser)
+      JSON.stringify(
+        registeredUser
+      )
     );
 
-    setUser(registeredUser);
+
+    setUser(
+      registeredUser
+    );
   }
 
+
+  // ==========================================================
+  // LOGOUT
+  // ==========================================================
+
   async function logout() {
+
     try {
+
       await api.logout();
+
     } catch {
-      // Server logout failure does not prevent local logout.
+
+      // Local logout continues even
+      // if server logout fails.
+
     }
+
 
     localStorage.removeItem(
       "medxai_token"
@@ -201,8 +346,14 @@ export function AuthProvider({
       "medxai_user"
     );
 
+
     setUser(null);
   }
+
+
+  // ==========================================================
+  // PROVIDER
+  // ==========================================================
 
   return (
     <AuthContext.Provider
@@ -219,14 +370,24 @@ export function AuthProvider({
   );
 }
 
+
+// ============================================================
+// HOOK
+// ============================================================
+
 export function useAuth() {
+
   const context =
-    useContext(AuthContext);
+    useContext(
+      AuthContext
+    );
 
   if (!context) {
+
     throw new Error(
       "useAuth must be used inside AuthProvider"
     );
+
   }
 
   return context;
