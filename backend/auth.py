@@ -1,45 +1,81 @@
 import datetime
+import os
 from typing import Optional
 
+import bcrypt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 
 from .database import get_db
 from . import models
 
 
-SECRET_KEY = "MEDXAI_SUPER_SECRET_KEY_EXPLAINABLE_MRI"
+# ============================================================
+# SECURITY CONFIGURATION
+# ============================================================
+
+SECRET_KEY = os.getenv(
+    "JWT_SECRET",
+    "MEDXAI_LOCAL_DEVELOPMENT_SECRET_CHANGE_ME"
+)
+
 ALGORITHM = "HS256"
+
 ACCESS_TOKEN_EXPIRE_DAYS = 7
 
 
-pwd_context = CryptContext(
-    schemes=["bcrypt"],
-    deprecated="auto"
-)
-
+# ============================================================
+# OAUTH2
+# ============================================================
 
 oauth2_scheme = OAuth2PasswordBearer(
     tokenUrl="auth/login"
 )
 
 
+# ============================================================
+# PASSWORD HASHING
+# ============================================================
+
+def get_password_hash(password: str) -> str:
+    password_bytes = password.encode("utf-8")
+
+    if len(password_bytes) > 72:
+        raise ValueError(
+            "Password cannot exceed 72 bytes"
+        )
+
+    hashed_password = bcrypt.hashpw(
+        password_bytes,
+        bcrypt.gensalt()
+    )
+
+    return hashed_password.decode("utf-8")
+
+
 def verify_password(
     plain_password: str,
     hashed_password: str
-):
-    return pwd_context.verify(
-        plain_password,
-        hashed_password
-    )
+) -> bool:
+    password_bytes = plain_password.encode("utf-8")
+
+    if len(password_bytes) > 72:
+        return False
+
+    try:
+        return bcrypt.checkpw(
+            password_bytes,
+            hashed_password.encode("utf-8")
+        )
+    except (ValueError, TypeError):
+        return False
 
 
-def get_password_hash(password: str):
-    return pwd_context.hash(password)
-
+# ============================================================
+# CREATE JWT ACCESS TOKEN
+# ============================================================
 
 def create_access_token(
     data: dict,
@@ -48,7 +84,10 @@ def create_access_token(
     to_encode = data.copy()
 
     if expires_delta:
-        expire = datetime.datetime.utcnow() + expires_delta
+        expire = (
+            datetime.datetime.utcnow()
+            + expires_delta
+        )
     else:
         expire = (
             datetime.datetime.utcnow()
@@ -69,6 +108,10 @@ def create_access_token(
 
     return encoded_jwt
 
+
+# ============================================================
+# GET CURRENT USER
+# ============================================================
 
 def get_current_user(
     token: str = Depends(oauth2_scheme),
@@ -99,7 +142,9 @@ def get_current_user(
 
     user = (
         db.query(models.User)
-        .filter(models.User.id == user_id)
+        .filter(
+            models.User.id == user_id
+        )
         .first()
     )
 
