@@ -9,6 +9,7 @@ from fastapi import (
     HTTPException,
     UploadFile,
     File,
+    Request,
 )
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,6 +18,7 @@ from fastapi.responses import FileResponse
 from fastapi.security import OAuth2PasswordRequestForm
 
 from sqlalchemy.orm import Session
+from sqlalchemy import inspect, text
 
 from .database import engine, Base, get_db
 from . import models
@@ -44,6 +46,48 @@ Base.metadata.create_all(bind=engine)
 
 
 # ============================================================
+# ROLE COLUMN COMPATIBILITY
+# ============================================================
+# Older MedXAI databases were created before doctor/patient roles
+# were introduced. Add the column automatically so deployment does
+# not require deleting the existing database.
+try:
+    user_columns = {column["name"] for column in inspect(engine).get_columns("users")}
+    if "role" not in user_columns:
+        with engine.begin() as connection:
+            connection.execute(
+                text("ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT 'patient'")
+            )
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE users SET role = 'patient' WHERE role IS NULL OR role = ''")
+        )
+except Exception as role_schema_error:
+    print(f"Role schema initialization warning: {role_schema_error}")
+
+
+def get_user_role(db: Session, user_id: str) -> str:
+    try:
+        value = db.execute(
+            text("SELECT role FROM users WHERE id = :user_id"),
+            {"user_id": user_id},
+        ).scalar_one_or_none()
+        return value if value in {"doctor", "patient"} else "patient"
+    except Exception:
+        return "patient"
+
+
+def public_user(db: Session, user: models.User) -> dict:
+    return {
+        "id": user.id,
+        "name": user.name,
+        "email": user.email,
+        "role": get_user_role(db, user.id),
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+    }
+
+
+# ============================================================
 # FASTAPI APP
 # ============================================================
 
@@ -61,7 +105,11 @@ app = FastAPI(
 # CORS
 # ============================================================
 
+frontend_url = os.getenv("FRONTEND_URL", "https://medxai-frontend.onrender.com").strip().rstrip("/")
+configured_origins = os.getenv("CORS_ORIGINS", "").strip()
+
 origins = [
+    frontend_url,
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "http://localhost:3000",
@@ -70,10 +118,20 @@ origins = [
     "http://127.0.0.1:8000",
 ]
 
+if configured_origins:
+    origins.extend(
+        origin.strip().rstrip("/")
+        for origin in configured_origins.split(",")
+        if origin.strip()
+    )
+
+# Remove duplicates while preserving order.
+origins = list(dict.fromkeys(origins))
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_origin_regex=r"https?://.*",
+    allow_origin_regex=r"^https://([a-zA-Z0-9-]+\.)?onrender\.com$|^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -144,15 +202,11 @@ def health_check():
 # AUTH - REGISTER
 # ============================================================
 
-@app.post("/auth/register")
-def register(
-    data: dict,
-    db: Session = Depends(get_db),
-):
-
+def _register_user(data: dict, db: Session, forced_role: str | None = None):
     name = data.get("name")
     email = data.get("email")
     password = data.get("password")
+    requested_role = forced_role or data.get("role", "patient")
 
     if not name or not email or not password:
         raise HTTPException(
@@ -160,13 +214,29 @@ def register(
             detail="Name, email, and password are required",
         )
 
-    name = name.strip()
-    email = email.lower().strip()
+    name = str(name).strip()
+    email = str(email).lower().strip()
+    role = str(requested_role).lower().strip()
+
+    if role not in {"doctor", "patient"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Role must be either doctor or patient",
+        )
+
+    if len(name) < 2:
+        raise HTTPException(status_code=400, detail="Name must be at least 2 characters")
 
     if len(password.encode("utf-8")) > 72:
         raise HTTPException(
             status_code=400,
             detail="Password must be 72 bytes or less",
+        )
+
+    if len(password) < 6:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 6 characters",
         )
 
     existing_user = (
@@ -182,38 +252,75 @@ def register(
         )
 
     user_id = str(uuid.uuid4())
+    hashed_pwd = auth.get_password_hash(password)
 
-    hashed_pwd = auth.get_password_hash(
-        password
-    )
+    # Insert the role with raw SQL so this remains compatible with the
+    # older SQLAlchemy User model that does not declare a role attribute.
+    try:
+        db.execute(
+            text(
+                "INSERT INTO users (id, name, email, password_hash, role) "
+                "VALUES (:id, :name, :email, :password_hash, :role)"
+            ),
+            {
+                "id": user_id,
+                "name": name,
+                "email": email,
+                "password_hash": hashed_pwd,
+                "role": role,
+            },
+        )
+        db.commit()
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Registration failed: {str(error)}",
+        )
 
-    user = models.User(
-        id=user_id,
-        name=name,
-        email=email,
-        password_hash=hashed_pwd,
-    )
-
-    db.add(user)
-    db.commit()
-    db.refresh(user)
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=500, detail="Registered user could not be loaded")
 
     access_token = auth.create_access_token(
         data={
             "sub": user.id,
             "email": user.email,
+            "role": role,
         }
     )
 
     return {
         "access_token": access_token,
         "token_type": "bearer",
-        "user": {
-            "id": user.id,
-            "name": user.name,
-            "email": user.email,
-        },
+        "user": public_user(db, user),
     }
+
+
+@app.post("/auth/register")
+def register(
+    data: dict,
+    db: Session = Depends(get_db),
+):
+    # Backward-compatible endpoint. New clients can send role=doctor/patient.
+    # If no role is supplied, patient is the safe default.
+    return _register_user(data, db)
+
+
+@app.post("/auth/patient/register")
+def patient_register(
+    data: dict,
+    db: Session = Depends(get_db),
+):
+    return _register_user(data, db, "patient")
+
+
+@app.post("/auth/doctor/register")
+def doctor_register(
+    data: dict,
+    db: Session = Depends(get_db),
+):
+    return _register_user(data, db, "doctor")
 
 
 # ============================================================
@@ -221,18 +328,29 @@ def register(
 # ============================================================
 
 @app.post("/auth/login")
-def login(
-    form_data: OAuth2PasswordRequestForm = Depends(),
+async def login(
+    request: Request,
     db: Session = Depends(get_db),
 ):
+    # Accept both the JSON body used by the React frontend and the
+    # application/x-www-form-urlencoded format used by OAuth clients.
+    content_type = request.headers.get("content-type", "").lower()
 
-    email = form_data.username.lower().strip()
-    password = form_data.password
+    if "application/json" in content_type:
+        data = await request.json()
+        email = str(data.get("email", "")).lower().strip()
+        password = str(data.get("password", ""))
+        requested_role = str(data.get("role", "")).lower().strip()
+    else:
+        form = await request.form()
+        email = str(form.get("username", form.get("email", ""))).lower().strip()
+        password = str(form.get("password", ""))
+        requested_role = str(form.get("role", "")).lower().strip()
 
     if not email or not password:
         raise HTTPException(
             status_code=400,
-            detail="Email and password required",
+            detail="Email and password are required",
         )
 
     user = (
@@ -241,36 +359,85 @@ def login(
         .first()
     )
 
-    if not user:
+    if not user or not auth.verify_password(password, user.password_hash):
         raise HTTPException(
             status_code=401,
             detail="Invalid email or password",
         )
 
-    if not auth.verify_password(
-        password,
-        user.password_hash,
-    ):
+    role = get_user_role(db, user.id)
+
+    if requested_role and requested_role in {"doctor", "patient"} and role != requested_role:
         raise HTTPException(
-            status_code=401,
-            detail="Invalid email or password",
+            status_code=403,
+            detail=(
+                "This account is a patient account. Please use Patient Login."
+                if requested_role == "doctor"
+                else "This account is a doctor account. Please use Doctor Login."
+            ),
         )
 
     access_token = auth.create_access_token(
         data={
             "sub": user.id,
             "email": user.email,
+            "role": role,
         }
     )
 
     return {
         "access_token": access_token,
         "token_type": "bearer",
-        "user": {
-            "id": user.id,
-            "name": user.name,
-            "email": user.email,
-        },
+        "user": public_user(db, user),
+    }
+
+
+@app.post("/auth/doctor/login")
+async def doctor_login(request: Request, db: Session = Depends(get_db)):
+    return await _role_login(request, db, "doctor")
+
+
+@app.post("/auth/patient/login")
+async def patient_login(request: Request, db: Session = Depends(get_db)):
+    return await _role_login(request, db, "patient")
+
+
+async def _role_login(request: Request, db: Session, required_role: str):
+    content_type = request.headers.get("content-type", "").lower()
+    if "application/json" in content_type:
+        data = await request.json()
+        email = str(data.get("email", "")).lower().strip()
+        password = str(data.get("password", ""))
+    else:
+        form = await request.form()
+        email = str(form.get("username", form.get("email", ""))).lower().strip()
+        password = str(form.get("password", ""))
+
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Email and password are required")
+
+    user = db.query(models.User).filter(models.User.email == email).first()
+    if not user or not auth.verify_password(password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    role = get_user_role(db, user.id)
+    if role != required_role:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "This account is a patient account. Please use Patient Login."
+                if required_role == "doctor"
+                else "This account is a doctor account. Please use Doctor Login."
+            ),
+        )
+
+    token = auth.create_access_token(
+        data={"sub": user.id, "email": user.email, "role": role}
+    )
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": public_user(db, user),
     }
 
 
@@ -283,14 +450,9 @@ def get_me(
     current_user: models.User = Depends(
         auth.get_current_user
     ),
+    db: Session = Depends(get_db),
 ):
-
-    return {
-        "id": current_user.id,
-        "name": current_user.name,
-        "email": current_user.email,
-        "created_at": current_user.created_at.isoformat(),
-    }
+    return public_user(db, current_user)
 
 
 # ============================================================
@@ -371,14 +533,9 @@ def get_profile(
     current_user: models.User = Depends(
         auth.get_current_user
     ),
+    db: Session = Depends(get_db),
 ):
-
-    return {
-        "id": current_user.id,
-        "name": current_user.name,
-        "email": current_user.email,
-        "created_at": current_user.created_at.isoformat(),
-    }
+    return public_user(db, current_user)
 
 
 # ============================================================
@@ -425,12 +582,7 @@ def update_profile(
     db.commit()
     db.refresh(current_user)
 
-    return {
-        "id": current_user.id,
-        "name": current_user.name,
-        "email": current_user.email,
-        "created_at": current_user.created_at.isoformat(),
-    }
+    return public_user(db, current_user)
 
 
 # ============================================================
