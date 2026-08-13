@@ -1,5 +1,9 @@
 import os
 import gc
+import uuid
+import io
+from datetime import datetime
+from typing import Optional
 
 # ============================================================
 # TENSORFLOW MEMORY & CPU OPTIMIZATIONS
@@ -11,12 +15,9 @@ os.environ["TF_NUM_INTRAOP_THREADS"] = "1"
 os.environ["TF_NUM_INTEROP_THREADS"] = "1"
 os.environ["MALLOC_TRIM_THRESHOLD_"] = "100000"
 
-import uuid
-import json
 import shutil
-from typing import Optional
-
 import tensorflow as tf
+import cv2
 
 tf.config.threading.set_intra_op_parallelism_threads(1)
 tf.config.threading.set_inter_op_parallelism_threads(1)
@@ -29,16 +30,15 @@ from fastapi import (
     File,
     Request,
 )
-
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
-from sqlalchemy.orm import Session
-from sqlalchemy import inspect, text
-
-from .database import engine, Base, get_db
-from . import models
+from .database import (
+    users_collection,
+    analyses_collection,
+    reports_collection,
+)
 from . import auth
 
 from .services.prediction import (
@@ -56,78 +56,33 @@ from .services.lime_explainer import (
 
 
 # ============================================================
-# DATABASE SETUP
+# USER & ANALYSIS FORMATTERS
 # ============================================================
 
-Base.metadata.create_all(bind=engine)
-
-try:
-    user_columns = {
-        column["name"]
-        for column in inspect(engine).get_columns("users")
-    }
-
-    if "role" not in user_columns:
-        with engine.begin() as connection:
-            connection.execute(
-                text(
-                    "ALTER TABLE users "
-                    "ADD COLUMN role VARCHAR(20) DEFAULT 'patient'"
-                )
-            )
-
-        with engine.begin() as connection:
-            connection.execute(
-                text(
-                    "UPDATE users "
-                    "SET role = 'patient' "
-                    "WHERE role IS NULL OR role = ''"
-                )
-            )
-
-except Exception as role_schema_error:
-    print(f"Role schema initialization warning: {role_schema_error}")
-
-
-# ============================================================
-# USER ROLE & PUBLIC USER
-# ============================================================
-
-def get_user_role(db: Session, user_id: str) -> str:
-    try:
-        value = db.execute(
-            text("SELECT role FROM users WHERE id = :user_id"),
-            {"user_id": user_id},
-        ).scalar_one_or_none()
-
-        if value in {"doctor", "patient"}:
-            return value
-        return "patient"
-    except Exception:
-        return "patient"
-
-
-def public_user(db: Session, user: models.User) -> dict:
+def public_user(user_doc: dict) -> dict:
     return {
-        "id": user.id,
-        "name": user.name,
-        "email": user.email,
-        "role": get_user_role(db, user.id),
-        "created_at": (
-            user.created_at.isoformat()
-            if user.created_at
-            else None
-        ),
+        "id": user_doc["_id"],
+        "name": user_doc.get("name", ""),
+        "email": user_doc.get("email", ""),
+        "role": user_doc.get("role", "patient"),
+        "created_at": user_doc.get("created_at"),
     }
 
 
+def format_analysis(doc: dict) -> dict:
+    if not doc:
+        return {}
+    doc["id"] = doc["_id"]
+    return doc
+
+
 # ============================================================
-# FASTAPI APP & CORS
+# FASTAPI APP & CORS SETUP
 # ============================================================
 
 app = FastAPI(
     title="MEDXAI - Explainable MRI Intelligence API",
-    description="Backend API for Alzheimer's MRI Disease Detection.",
+    description="Backend API for Alzheimer's MRI Disease Detection backed by MongoDB Atlas.",
     version="1.0.0",
 )
 
@@ -195,18 +150,18 @@ app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "MEDXAI FastAPI Engine"}
+    return {"status": "ok", "service": "MEDXAI FastAPI Engine + MongoDB Atlas"}
 
 @app.get("/api/health")
 def health_check():
-    return {"status": "ok", "service": "MEDXAI FastAPI Engine"}
+    return {"status": "ok", "service": "MEDXAI FastAPI Engine + MongoDB Atlas"}
 
 
 # ============================================================
 # AUTHENTICATION ROUTES
 # ============================================================
 
-def _register_user(data: dict, db: Session, forced_role: Optional[str] = None):
+def _register_user(data: dict, forced_role: Optional[str] = None):
     name = str(data.get("name", "")).strip()
     email = str(data.get("email", "")).lower().strip()
     password = str(data.get("password", ""))
@@ -215,84 +170,87 @@ def _register_user(data: dict, db: Session, forced_role: Optional[str] = None):
     if not name or not email or not password:
         raise HTTPException(status_code=400, detail="Name, email, and password are required")
 
-    existing_user = db.query(models.User).filter(models.User.email == email).first()
+    existing_user = users_collection.find_one({"email": email})
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already registered")
 
     user_id = str(uuid.uuid4())
     hashed_password = auth.get_password_hash(password)
+    created_at = datetime.utcnow().isoformat()
 
-    db.execute(
-        text("INSERT INTO users (id, name, email, password_hash, role) VALUES (:id, :name, :email, :password_hash, :role)"),
-        {"id": user_id, "name": name, "email": email, "password_hash": hashed_password, "role": role}
-    )
-    db.commit()
+    user_doc = {
+        "_id": user_id,
+        "name": name,
+        "email": email,
+        "password_hash": hashed_password,
+        "role": role,
+        "created_at": created_at,
+    }
 
-    user = db.query(models.User).filter(models.User.id == user_id).first()
-    access_token = auth.create_access_token(data={"sub": user.id, "email": user.email, "role": role})
+    users_collection.insert_one(user_doc)
+    access_token = auth.create_access_token(data={"sub": user_id, "email": email, "role": role})
 
-    return {"access_token": access_token, "token_type": "bearer", "user": public_user(db, user)}
+    return {"access_token": access_token, "token_type": "bearer", "user": public_user(user_doc)}
 
 
 @app.post("/auth/register")
-def register(data: dict, db: Session = Depends(get_db)):
-    return _register_user(data, db)
+def register(data: dict):
+    return _register_user(data)
 
 @app.post("/auth/patient/register")
-def patient_register(data: dict, db: Session = Depends(get_db)):
-    return _register_user(data, db, "patient")
+def patient_register(data: dict):
+    return _register_user(data, "patient")
 
 @app.post("/auth/doctor/register")
-def doctor_register(data: dict, db: Session = Depends(get_db)):
-    return _register_user(data, db, "doctor")
+def doctor_register(data: dict):
+    return _register_user(data, "doctor")
 
 
-async def _perform_login(request: Request, db: Session, required_role: Optional[str] = None):
+async def _perform_login(request: Request, required_role: Optional[str] = None):
     content_type = request.headers.get("content-type", "").lower()
     if "application/json" in content_type:
         data = await request.json()
         email = str(data.get("email", "")).lower().strip()
         password = str(data.get("password", ""))
-        requested_role = str(data.get("role", "")).lower().strip()
     else:
         form = await request.form()
         email = str(form.get("username", form.get("email", ""))).lower().strip()
         password = str(form.get("password", ""))
-        requested_role = str(form.get("role", "")).lower().strip()
 
-    user = db.query(models.User).filter(models.User.email == email).first()
-    if not user or not auth.verify_password(password, user.password_hash):
+    user = users_collection.find_one({"email": email})
+    if not user or not auth.verify_password(password, user.get("password_hash", "")):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
-    role = get_user_role(db, user.id)
-    access_token = auth.create_access_token(data={"sub": user.id, "email": user.email, "role": role})
+    user_id = user["_id"]
+    role = user.get("role", "patient")
+    access_token = auth.create_access_token(data={"sub": user_id, "email": email, "role": role})
 
-    return {"access_token": access_token, "token_type": "bearer", "user": public_user(db, user)}
+    return {"access_token": access_token, "token_type": "bearer", "user": public_user(user)}
 
 
 @app.post("/auth/login")
-async def login(request: Request, db: Session = Depends(get_db)):
-    return await _perform_login(request, db)
+async def login(request: Request):
+    return await _perform_login(request)
 
 @app.post("/auth/doctor/login")
-async def doctor_login(request: Request, db: Session = Depends(get_db)):
-    return await _perform_login(request, db, "doctor")
+async def doctor_login(request: Request):
+    return await _perform_login(request, "doctor")
 
 @app.post("/auth/patient/login")
-async def patient_login(request: Request, db: Session = Depends(get_db)):
-    return await _perform_login(request, db, "patient")
+async def patient_login(request: Request):
+    return await _perform_login(request, "patient")
 
 @app.get("/auth/me")
-def get_me(current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(get_db)):
-    return public_user(db, current_user)
+def get_me(current_user: dict = Depends(auth.get_current_user)):
+    return public_user(current_user)
 
 @app.post("/auth/logout")
-def logout(current_user: models.User = Depends(auth.get_current_user)):
+def logout(current_user: dict = Depends(auth.get_current_user)):
     return {"message": "Logged out successfully"}
 
 @app.get("/profile")
-def get_profile(current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(get_db)):
-    return public_user(db, current_user)
+def get_profile(current_user: dict = Depends(auth.get_current_user)):
+    return public_user(current_user)
 
 
 # ============================================================
@@ -301,25 +259,21 @@ def get_profile(current_user: models.User = Depends(auth.get_current_user), db: 
 
 @app.get("/dashboard/stats")
 def get_dashboard_stats(
-    current_user: models.User = Depends(auth.get_current_user),
-    db: Session = Depends(get_db),
+    current_user: dict = Depends(auth.get_current_user),
 ):
-    all_analyses = (
-        db.query(models.Analysis)
-        .filter(models.Analysis.user_id == current_user.id)
-        .order_by(models.Analysis.created_at.desc())
-        .all()
-    )
+    user_id = current_user["_id"]
+    cursor = analyses_collection.find({"user_id": user_id}).sort("created_at", -1)
+    all_analyses = [format_analysis(doc) for doc in cursor]
 
     total = len(all_analyses)
     avg_confidence = (
-        sum(float(a.confidence_percentage or 0) for a in all_analyses) / total
+        sum(float(a.get("confidence_percentage", 0) or 0) for a in all_analyses) / total
         if total > 0
         else 0.0
     )
 
     recent = all_analyses[:5]
-    latest_prediction = recent[0].prediction if recent else None
+    latest_prediction = recent[0].get("prediction") if recent else None
 
     return {
         "total_analyses": total,
@@ -336,8 +290,7 @@ def get_dashboard_stats(
 @app.post("/predict")
 async def predict(
     file: UploadFile = File(...),
-    current_user: models.User = Depends(auth.get_current_user),
-    db: Session = Depends(get_db),
+    current_user: dict = Depends(auth.get_current_user),
 ):
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file selected")
@@ -365,23 +318,21 @@ async def predict(
 
     gradcam_url = f"/uploads/{gradcam_filename}" if gradcam_error is None and os.path.exists(gradcam_path) else None
 
-    analysis_record = models.Analysis(
-        id=analysis_id,
-        user_id=current_user.id,
-        filename=safe_filename,
-        prediction=prediction_result["prediction"],
-        confidence=prediction_result["confidence"],
-        confidence_percentage=prediction_result["confidence_percentage"],
-        probabilities=prediction_result.get("probabilities", {}),
-        gradcam_url=gradcam_url,
-        lime_url=None,
-        image_url=f"/uploads/{filename}",
-    )
+    analysis_doc = {
+        "_id": analysis_id,
+        "user_id": current_user["_id"],
+        "filename": safe_filename,
+        "prediction": prediction_result["prediction"],
+        "confidence": prediction_result["confidence"],
+        "confidence_percentage": prediction_result["confidence_percentage"],
+        "probabilities": prediction_result.get("probabilities", {}),
+        "gradcam_url": gradcam_url,
+        "lime_url": None,
+        "image_url": f"/uploads/{filename}",
+        "created_at": datetime.utcnow().isoformat(),
+    }
 
-    db.add(analysis_record)
-    db.commit()
-    db.refresh(analysis_record)
-
+    analyses_collection.insert_one(analysis_doc)
     gc.collect()
 
     return {
@@ -407,31 +358,22 @@ async def predict(
 
 @app.get("/analyses")
 def get_analyses(
-    current_user: models.User = Depends(auth.get_current_user),
-    db: Session = Depends(get_db),
+    current_user: dict = Depends(auth.get_current_user),
 ):
-    return (
-        db.query(models.Analysis)
-        .filter(models.Analysis.user_id == current_user.id)
-        .order_by(models.Analysis.created_at.desc())
-        .all()
-    )
+    user_id = current_user["_id"]
+    cursor = analyses_collection.find({"user_id": user_id}).sort("created_at", -1)
+    return [format_analysis(doc) for doc in cursor]
 
 
 @app.get("/analyses/{id}")
 def get_analysis_by_id(
     id: str,
-    current_user: models.User = Depends(auth.get_current_user),
-    db: Session = Depends(get_db),
+    current_user: dict = Depends(auth.get_current_user),
 ):
-    record = (
-        db.query(models.Analysis)
-        .filter(models.Analysis.id == id, models.Analysis.user_id == current_user.id)
-        .first()
-    )
+    record = analyses_collection.find_one({"_id": id, "user_id": current_user["_id"]})
     if not record:
         raise HTTPException(status_code=404, detail="Analysis not found")
-    return record
+    return format_analysis(record)
 
 
 # ============================================================
@@ -441,28 +383,25 @@ def get_analysis_by_id(
 @app.post("/explain/lime")
 def get_lime_explain(
     data: Optional[dict] = None,
-    current_user: models.User = Depends(auth.get_current_user),
-    db: Session = Depends(get_db),
+    current_user: dict = Depends(auth.get_current_user),
 ):
     if data is None:
         data = {}
 
     analysis_id = data.get("analysis_id")
+    user_id = current_user["_id"]
 
     if analysis_id:
-        record = db.query(models.Analysis).filter(
-            models.Analysis.id == analysis_id,
-            models.Analysis.user_id == current_user.id,
-        ).first()
+        record = analyses_collection.find_one({"_id": analysis_id, "user_id": user_id})
     else:
-        record = db.query(models.Analysis).filter(
-            models.Analysis.user_id == current_user.id
-        ).order_by(models.Analysis.created_at.desc()).first()
+        cursor = analyses_collection.find({"user_id": user_id}).sort("created_at", -1).limit(1)
+        records = list(cursor)
+        record = records[0] if records else None
 
-    if not record or not record.image_url:
+    if not record or not record.get("image_url"):
         raise HTTPException(status_code=404, detail="Analysis record or image not found")
 
-    image_filename = record.image_url.replace("/uploads/", "")
+    image_filename = record["image_url"].replace("/uploads/", "")
     image_path = os.path.join(UPLOAD_DIR, image_filename)
     lime_filename = f"lime_{image_filename}"
     lime_path = os.path.join(UPLOAD_DIR, lime_filename)
@@ -474,13 +413,12 @@ def get_lime_explain(
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"LIME generation failed: {str(error)}")
 
-    record.lime_url = f"/uploads/{lime_filename}"
-    db.commit()
-    db.refresh(record)
+    lime_url = f"/uploads/{lime_filename}"
+    analyses_collection.update_one({"_id": record["_id"]}, {"$set": {"lime_url": lime_url}})
 
     gc.collect()
 
-    return {"analysis_id": record.id, "url": f"/uploads/{lime_filename}", "features": []}
+    return {"analysis_id": record["_id"], "url": lime_url, "features": []}
 
 
 # ============================================================
@@ -489,23 +427,22 @@ def get_lime_explain(
 
 @app.get("/reports")
 def get_reports(
-    current_user: models.User = Depends(auth.get_current_user),
-    db: Session = Depends(get_db),
+    current_user: dict = Depends(auth.get_current_user),
 ):
-    return (
-        db.query(models.Report)
-        .filter(models.Report.user_id == current_user.id)
-        .order_by(models.Report.created_at.desc())
-        .all()
-    )
+    user_id = current_user["_id"]
+    cursor = reports_collection.find({"user_id": user_id}).sort("created_at", -1)
+    reports = []
+    for doc in cursor:
+        doc["id"] = doc["_id"]
+        reports.append(doc)
+    return reports
+
 
 # ============================================================
 # FAST & ENHANCED PDF REPORT GENERATOR (< 0.5s BUILD TIME)
 # ============================================================
 
-def generate_pdf_report(report_id: str, analysis: models.Analysis, pdf_path: str):
-    import io
-    import cv2
+def generate_pdf_report(report_id: str, analysis: dict, pdf_path: str):
     from reportlab.lib.pagesizes import letter
     from reportlab.lib import colors
     from reportlab.platypus import (
@@ -564,13 +501,13 @@ def generate_pdf_report(report_id: str, analysis: models.Analysis, pdf_path: str
     story.append(Paragraph("MEDXAI CLINICAL MRI RESEARCH REPORT", title_style))
     story.append(Spacer(1, 6))
 
-    prediction = str(getattr(analysis, "prediction", "Unknown"))
-    confidence = float(getattr(analysis, "confidence_percentage", 0) or 0)
+    prediction = str(analysis.get("prediction", "Unknown"))
+    confidence = float(analysis.get("confidence_percentage", 0) or 0)
 
     # 1. Overview Table
     info_data = [
         [Paragraph("<b>Report ID:</b>", styles["Normal"]), Paragraph(str(report_id), styles["Normal"])],
-        [Paragraph("<b>Scan Filename:</b>", styles["Normal"]), Paragraph(str(getattr(analysis, "filename", "")), styles["Normal"])],
+        [Paragraph("<b>Scan Filename:</b>", styles["Normal"]), Paragraph(str(analysis.get("filename", "")), styles["Normal"])],
         [Paragraph("<b>Classification:</b>", styles["Normal"]), Paragraph(f"<b>{prediction}</b>", styles["Normal"])],
         [Paragraph("<b>Confidence:</b>", styles["Normal"]), Paragraph(f"<b>{confidence:.2f}%</b>", styles["Normal"])],
     ]
@@ -589,7 +526,7 @@ def generate_pdf_report(report_id: str, analysis: models.Analysis, pdf_path: str
     story.append(Spacer(1, 8))
 
     # 2. Probability Breakdown Table
-    probs = getattr(analysis, "probabilities", {}) or {}
+    probs = analysis.get("probabilities", {}) or {}
     if probs:
         story.append(Paragraph("Stage Probability Distribution", section_style))
         prob_rows = [["Alzheimer's Stage", "Probability Score"]]
@@ -637,9 +574,9 @@ def generate_pdf_report(report_id: str, analysis: models.Analysis, pdf_path: str
             return None, None
 
     # Process all 3 visual assets
-    t1, img1 = make_fast_thumbnail(getattr(analysis, "image_url", ""), "Original MRI Scan")
-    t2, img2 = make_fast_thumbnail(getattr(analysis, "gradcam_url", ""), "Grad-CAM Heatmap")
-    t3, img3 = make_fast_thumbnail(getattr(analysis, "lime_url", ""), "LIME Feature Map")
+    t1, img1 = make_fast_thumbnail(analysis.get("image_url", ""), "Original MRI Scan")
+    t2, img2 = make_fast_thumbnail(analysis.get("gradcam_url", ""), "Grad-CAM Heatmap")
+    t3, img3 = make_fast_thumbnail(analysis.get("lime_url", ""), "LIME Feature Map")
 
     visual_titles = [t for t in [t1, t2, t3] if t is not None]
     visual_images = [i for i in [img1, img2, img3] if i is not None]
@@ -667,7 +604,7 @@ def generate_pdf_report(report_id: str, analysis: models.Analysis, pdf_path: str
             f"• <b>Grad-CAM:</b> Highlights high-attention convolutional activation zones (red/yellow regions) "
             f"corresponding to structural tissue atrophy or ventricular expansion.<br/>"
             f"• <b>LIME:</b> Superpixel attribution isolates local pixel groups contributing positively (red) "
-            f"or negatively (blue) toward the classifier's diagnosis.",
+            f"or negatively (cyan) toward the classifier's diagnosis.",
             body_style,
         )
     )
@@ -690,67 +627,57 @@ def generate_pdf_report(report_id: str, analysis: models.Analysis, pdf_path: str
 @app.post("/reports/{id}")
 def create_report(
     id: str,
-    current_user: models.User = Depends(auth.get_current_user),
-    db: Session = Depends(get_db),
+    current_user: dict = Depends(auth.get_current_user),
 ):
-    analysis = (
-        db.query(models.Analysis)
-        .filter(models.Analysis.id == id, models.Analysis.user_id == current_user.id)
-        .first()
-    )
+    user_id = current_user["_id"]
+    analysis = analyses_collection.find_one({"_id": id, "user_id": user_id})
     if not analysis:
         raise HTTPException(status_code=404, detail="Analysis not found")
 
     report_id = str(uuid.uuid4())
-    original_name = os.path.basename(analysis.filename or "MRI")
+    original_name = os.path.basename(analysis.get("filename") or "MRI")
     pdf_filename = f"Report_{os.path.splitext(original_name)[0]}.pdf"
     pdf_path = os.path.join(REPORTS_DIR, f"{report_id}.pdf")
 
     generate_pdf_report(report_id, analysis, pdf_path)
 
-    report_obj = models.Report(
-        id=report_id,
-        analysis_id=id,
-        user_id=current_user.id,
-        filename=pdf_filename,
-        content="PDF Report generated successfully",
-    )
+    created_at = datetime.utcnow().isoformat()
+    report_doc = {
+        "_id": report_id,
+        "analysis_id": id,
+        "user_id": user_id,
+        "filename": pdf_filename,
+        "content": "PDF Report generated successfully",
+        "created_at": created_at,
+    }
 
-    db.add(report_obj)
-    db.commit()
-    db.refresh(report_obj)
-
+    reports_collection.insert_one(report_doc)
     gc.collect()
 
     return {
-        "id": report_obj.id,
-        "analysis_id": report_obj.analysis_id,
-        "filename": report_obj.filename,
-        "content": report_obj.content,
-        "download_url": f"/reports/{report_obj.id}/download",
-        "created_at": report_obj.created_at.isoformat() if report_obj.created_at else None,
+        "id": report_id,
+        "analysis_id": id,
+        "filename": pdf_filename,
+        "content": "PDF Report generated successfully",
+        "download_url": f"/reports/{report_id}/download",
+        "created_at": created_at,
     }
 
 
 @app.get("/reports/{id}/download")
 def download_report(
     id: str,
-    current_user: models.User = Depends(auth.get_current_user),
-    db: Session = Depends(get_db),
+    current_user: dict = Depends(auth.get_current_user),
 ):
-    report = (
-        db.query(models.Report)
-        .filter(models.Report.id == id, models.Report.user_id == current_user.id)
-        .first()
-    )
+    report = reports_collection.find_one({"_id": id, "user_id": current_user["_id"]})
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
 
-    pdf_path = os.path.join(REPORTS_DIR, f"{report.id}.pdf")
+    pdf_path = os.path.join(REPORTS_DIR, f"{report['_id']}.pdf")
     if not os.path.exists(pdf_path):
         raise HTTPException(status_code=404, detail="Report file not found")
 
-    return FileResponse(pdf_path, filename=report.filename, media_type="application/pdf")
+    return FileResponse(pdf_path, filename=report["filename"], media_type="application/pdf")
 
 
 if __name__ == "__main__":
