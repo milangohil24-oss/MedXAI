@@ -1,17 +1,27 @@
 import os
+import gc
 
 # ============================================================
-# TENSORFLOW MEMORY SETTINGS
+# TENSORFLOW MEMORY & CPU OPTIMIZATIONS
 # ============================================================
-
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # Disable GPU searches
+
+# Restrict thread allocation to reduce RAM usage
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["TF_NUM_INTRAOP_THREADS"] = "1"
+os.environ["TF_NUM_INTEROP_THREADS"] = "1"
 
 import uuid
 import json
 import shutil
-
 from typing import Optional
+
+import tensorflow as tf
+
+# Limit internal thread pools
+tf.config.threading.set_intra_op_parallelism_threads(1)
+tf.config.threading.set_inter_op_parallelism_threads(1)
 
 from fastapi import (
     FastAPI,

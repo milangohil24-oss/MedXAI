@@ -478,17 +478,3 @@ def save_gradcam_overlay(
         "predictions": predictions,
         "heatmap_shape": heatmap.shape
     }
-def generate_gradcam(model, image_path, output_path):
-    """
-    Generate and save a Grad-CAM overlay image.
-
-    Compatible with backend.main.py.
-    """
-
-    result = save_gradcam_overlay(
-        image_path=image_path,
-        output_path=output_path,
-        model=model,
-    )
-
-    return result
