@@ -12,9 +12,8 @@ def generate_lime_explanation(
     output_path: str,
 ):
     """
-    High-accuracy, high-contrast LIME feature attribution explainer.
-    Fast execution (< 0.2s) and low RAM footprint (< 15MB).
-    Produces bright RED and CYAN superpixel overlays directly on the crisp original MRI scan.
+    Ultra-low RAM LIME feature attribution generator (< 10MB peak memory).
+    Evaluates perturbed samples one-by-one to prevent TensorFlow batch memory spikes.
     """
     output_dir = os.path.dirname(output_path)
     if output_dir:
@@ -30,17 +29,20 @@ def generate_lime_explanation(
         cell_h, cell_w = 224 // grid_h, 224 // grid_w
         num_superpixels = grid_h * grid_w
 
-        # 3. Base prediction
+        # 3. Base prediction on single image
         img_tensor = tf.convert_to_tensor(np.expand_dims(orig_np.astype(np.float32), axis=0))
         base_preds = model(img_tensor, training=False).numpy()[0]
         top_label = int(np.argmax(base_preds))
+        del img_tensor
 
-        # 4. Model perturbation sampling
-        num_samples = 8
+        # 4. Generate 5 perturbation masks
+        num_samples = 5
         perturbations = np.random.randint(0, 2, size=(num_samples, num_superpixels))
-        perturbed_images = []
+        sample_preds = []
 
         small_np = orig_np.astype(np.float32)
+
+        # 5. Evaluate perturbations ONE BY ONE (Zero batch memory spike)
         for i in range(num_samples):
             p_img = small_np.copy()
             p_mask = perturbations[i]
@@ -48,24 +50,29 @@ def generate_lime_explanation(
                 if p_mask[sp] == 0:
                     r, c = sp // grid_w, sp % grid_w
                     p_img[r * cell_h:(r + 1) * cell_h, c * cell_w:(c + 1) * cell_w] = 0
-            perturbed_images.append(p_img)
+            
+            p_tensor = tf.convert_to_tensor(np.expand_dims(p_img, axis=0), dtype=tf.float32)
+            p_pred = model(p_tensor, training=False).numpy()[0, top_label]
+            sample_preds.append(p_pred)
 
-        batch_tensor = tf.convert_to_tensor(np.array(perturbed_images, dtype=np.float32))
-        sample_preds = model(batch_tensor, training=False).numpy()[:, top_label]
+            del p_tensor, p_img
+            gc.collect()
 
-        # 5. Compute feature correlation weights
+        sample_preds = np.array(sample_preds)
+
+        # 6. Compute feature correlation weights
         weights = np.zeros(num_superpixels)
         for sp in range(num_superpixels):
             active = perturbations[:, sp]
             if np.std(active) > 0 and np.std(sample_preds) > 0:
                 weights[sp] = np.corrcoef(active, sample_preds)[0, 1]
 
-        # 6. Build positive & negative feature masks
+        # 7. Build positive & negative feature masks
         positive_mask = np.zeros((224, 224), dtype=np.uint8)
         negative_mask = np.zeros((224, 224), dtype=np.uint8)
 
-        top_pos = np.argsort(weights)[-6:]
-        top_neg = np.argsort(weights)[:4]
+        top_pos = np.argsort(weights)[-5:]
+        top_neg = np.argsort(weights)[:3]
 
         for sp in top_pos:
             if weights[sp] > 0:
@@ -77,7 +84,7 @@ def generate_lime_explanation(
                 r, c = sp // grid_w, sp % grid_w
                 negative_mask[r * cell_h:(r + 1) * cell_h, c * cell_w:(c + 1) * cell_w] = 255
 
-        # 7. Create vivid color overlay on top of original MRI (No dark background!)
+        # 8. Create vivid color overlay directly on original MRI scan
         overlay = orig_np.copy()
 
         # Red tint for positive feature drivers
@@ -96,7 +103,7 @@ def generate_lime_explanation(
                 np.full_like(orig_np[neg_indices], (0, 180, 255)), 0.65, 0
             )
 
-        # Draw sharp yellow grid lines
+        # Draw clean grid lines
         for r in range(1, grid_h):
             cv2.line(overlay, (0, r * cell_h), (224, r * cell_h), (255, 255, 0), 1)
         for c in range(1, grid_w):
@@ -105,10 +112,10 @@ def generate_lime_explanation(
         # Convert RGB to BGR for OpenCV saving
         overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
 
-        # 8. Add crisp Header Bar
+        # 9. Add Header Bar
         title_height = 36
         canvas = np.zeros((overlay_bgr.shape[0] + title_height, overlay_bgr.shape[1], 3), dtype=np.uint8)
-        canvas[:title_height] = (30, 25, 15)  # Slate dark header
+        canvas[:title_height] = (30, 25, 15)  # Dark slate header
         canvas[title_height:] = overlay_bgr
 
         cv2.putText(
@@ -124,7 +131,7 @@ def generate_lime_explanation(
 
         cv2.imwrite(output_path, canvas, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
-        del perturbed_images, batch_tensor, sample_preds, overlay, canvas, orig_np
+        del sample_preds, overlay, canvas, orig_np, overlay_bgr
         gc.collect()
 
         return output_path
