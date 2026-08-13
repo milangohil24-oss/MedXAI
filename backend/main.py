@@ -4,13 +4,16 @@ import gc
 # ============================================================
 # TENSORFLOW MEMORY & CPU OPTIMIZATIONS
 # ============================================================
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # Disable GPU searches
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"      # Suppress all non-error TF logs
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"      # Force CPU mode (disable GPU searches)
 
 # Restrict thread allocation to reduce RAM usage
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["TF_NUM_INTRAOP_THREADS"] = "1"
 os.environ["TF_NUM_INTEROP_THREADS"] = "1"
+
+# Force C++ memory allocator to release unreferenced heap back to OS
+os.environ["MALLOC_TRIM_THRESHOLD_"] = "100000"
 
 import uuid
 import json

@@ -15,30 +15,13 @@ CLASS_NAMES = [
     "Moderate Demented"
 ]
 
-
-# ============================================================
-# FIND EFFICIENTNET BASE MODEL
-# ============================================================
-
-def get_efficientnet_base(model):
-    for layer in model.layers:
-        if isinstance(layer, tf.keras.Model):
-            if "efficientnet" in layer.name.lower():
-                return layer
-
-    for layer in model.layers:
-        if isinstance(layer, tf.keras.Model):
-            return layer
-
-    return model
+# Global cache for the Grad-CAM feature model graph
+_cached_grad_model = None
 
 
-# ============================================================
-# FIND LAST CONVOLUTIONAL LAYER
-# ============================================================
-
-def get_last_conv_layer(model_or_base):
-    for layer in reversed(model_or_base.layers):
+def get_last_conv_layer(model):
+    """Find the last 4D feature map layer in the model."""
+    for layer in reversed(model.layers):
         try:
             shape = layer.output.shape
             if len(shape) == 4 and shape[1] is not None:
@@ -46,12 +29,51 @@ def get_last_conv_layer(model_or_base):
         except Exception:
             continue
 
-    raise ValueError("No suitable 4D convolutional feature layer found.")
+    # If nested inside a submodel (e.g. EfficientNet base)
+    for layer in model.layers:
+        if isinstance(layer, tf.keras.Model):
+            for sub_layer in reversed(layer.layers):
+                try:
+                    shape = sub_layer.output.shape
+                    if len(shape) == 4 and shape[1] is not None:
+                        return sub_layer
+                except Exception:
+                    continue
+
+    raise ValueError("No 4D convolutional feature layer found for Grad-CAM.")
 
 
-# ============================================================
-# LOAD AND PREPROCESS MRI
-# ============================================================
+def get_grad_model(model):
+    """Reuse cached Grad-CAM feature model to avoid memory spikes."""
+    global _cached_grad_model
+    if _cached_grad_model is not None:
+        return _cached_grad_model
+
+    target_layer = get_last_conv_layer(model)
+
+    try:
+        _cached_grad_model = tf.keras.models.Model(
+            inputs=model.inputs,
+            outputs=[target_layer.output, model.output]
+        )
+    except Exception:
+        # Fallback for nested model architectures
+        base_model = None
+        for layer in model.layers:
+            if isinstance(layer, tf.keras.Model):
+                base_model = layer
+                break
+
+        if base_model is not None:
+            _cached_grad_model = tf.keras.models.Model(
+                inputs=base_model.inputs,
+                outputs=[target_layer.output, base_model.output]
+            )
+        else:
+            _cached_grad_model = model
+
+    return _cached_grad_model
+
 
 def load_image(image_path):
     if not os.path.exists(image_path):
@@ -67,87 +89,32 @@ def load_image(image_path):
     return original_image, img_array
 
 
-# ============================================================
-# GRAD-CAM HEATMAP (WITH DUAL-FALLBACK GRAPH TRAVERSAL)
-# ============================================================
-
 def make_gradcam_heatmap(image_path, model, pred_index=None):
     original_image, img_array = load_image(image_path)
     img_tensor = tf.convert_to_tensor(img_array, dtype=tf.float32)
 
-    target_layer = None
-    base_model = get_efficientnet_base(model)
+    grad_model = get_grad_model(model)
 
-    # 1. Try finding target layer inside nested base model
-    try:
-        target_layer = get_last_conv_layer(base_model)
-    except Exception:
-        pass
+    with tf.GradientTape() as tape:
+        model_outputs = grad_model(img_tensor, training=False)
 
-    # 2. Fallback: search outer model directly
-    if target_layer is None:
-        target_layer = get_last_conv_layer(model)
+        if isinstance(model_outputs, (list, tuple)) and len(model_outputs) == 2:
+            conv_outputs, predictions = model_outputs
+        else:
+            conv_outputs = model_outputs
+            predictions = model(img_tensor, training=False)
 
-    grads = None
-    conv_outputs = None
-    predictions = None
+        if pred_index is None:
+            pred_index = tf.argmax(predictions[0])
 
-    # METHOD A: Direct Graph Trace (Outer Model)
-    try:
-        grad_model = tf.keras.models.Model(
-            inputs=model.inputs,
-            outputs=[target_layer.output, model.output]
-        )
+        pred_index = tf.cast(pred_index, tf.int32)
+        class_output = predictions[0, pred_index]
 
-        with tf.GradientTape() as tape:
-            conv_outputs, predictions = grad_model(img_tensor, training=False)
-            if pred_index is None:
-                pred_index = tf.argmax(predictions[0])
-            pred_index = tf.cast(pred_index, tf.int32)
-            class_output = predictions[0, pred_index]
-
-        grads = tape.gradient(class_output, conv_outputs)
-    except Exception:
-        grads = None
-
-    # METHOD B: Reconstruct Sequential Flow if Method A returned None
-    if grads is None:
-        sub_model = tf.keras.models.Model(
-            inputs=base_model.inputs,
-            outputs=[target_layer.output, base_model.output]
-        )
-
-        base_idx = None
-        for idx, layer in enumerate(model.layers):
-            if layer is base_model or layer.name == base_model.name:
-                base_idx = idx
-                break
-
-        classifier_layers = model.layers[base_idx + 1:] if base_idx is not None else []
-
-        with tf.GradientTape() as tape:
-            conv_outputs, base_out = sub_model(img_tensor, training=False)
-            x = base_out
-
-            for layer in classifier_layers:
-                try:
-                    x = layer(x, training=False)
-                except TypeError:
-                    x = layer(x)
-
-            predictions = x
-
-            if pred_index is None:
-                pred_index = tf.argmax(predictions[0])
-            pred_index = tf.cast(pred_index, tf.int32)
-            class_output = tf.gather(predictions[0], pred_index)
-
-        grads = tape.gradient(class_output, conv_outputs)
+    grads = tape.gradient(class_output, conv_outputs)
 
     if grads is None:
-        raise ValueError("Grad-CAM failure: Gradients could not be derived from model output.")
+        raise ValueError("Grad-CAM failure: Gradients returned None.")
 
-    # Compute Grad-CAM heatmap
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
     conv_outputs = conv_outputs[0]
 
@@ -163,10 +130,6 @@ def make_gradcam_heatmap(image_path, model, pred_index=None):
 
     return heatmap_np, original_image, pred_idx_int, pred_array
 
-
-# ============================================================
-# CREATE OVERLAY
-# ============================================================
 
 def create_gradcam_overlay(original_image, heatmap, alpha=0.40):
     original_image = np.asarray(original_image)
@@ -200,35 +163,6 @@ def create_gradcam_overlay(original_image, heatmap, alpha=0.40):
 
     return overlay
 
-
-# ============================================================
-# SAVE OVERLAY
-# ============================================================
-
-def save_gradcam_overlay(image_path, output_path, model, pred_index=None, alpha=0.40):
-    heatmap, original_image, predicted_index, predictions = make_gradcam_heatmap(
-        image_path, model, pred_index
-    )
-
-    overlay = create_gradcam_overlay(original_image, heatmap, alpha)
-
-    output_dir = os.path.dirname(output_path)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-
-    Image.fromarray(overlay).save(output_path)
-
-    return {
-        "output_path": output_path,
-        "predicted_index": predicted_index,
-        "predictions": predictions,
-        "heatmap_shape": heatmap.shape
-    }
-
-
-# ============================================================
-# COMPLETE PIPELINE
-# ============================================================
 
 def generate_gradcam(image_path, model, output_path=None, pred_index=None, alpha=0.40):
     heatmap, original_image, predicted_index, predictions = make_gradcam_heatmap(
