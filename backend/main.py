@@ -3,6 +3,8 @@ import uuid
 import json
 import shutil
 
+from typing import Optional
+
 from fastapi import (
     FastAPI,
     Depends,
@@ -15,7 +17,6 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-from fastapi.security import OAuth2PasswordRequestForm
 
 from sqlalchemy.orm import Session
 from sqlalchemy import inspect, text
@@ -46,121 +47,193 @@ Base.metadata.create_all(bind=engine)
 
 
 # ============================================================
-# ROLE COLUMN COMPATIBILITY
+# DATABASE SCHEMA COMPATIBILITY
 # ============================================================
-# Older MedXAI databases were created before doctor/patient roles
-# were introduced. Add the column automatically so deployment does
-# not require deleting the existing database.
+# Older databases may not have the "role" column.
+# Add it automatically if necessary.
+
 try:
-    user_columns = {column["name"] for column in inspect(engine).get_columns("users")}
+    user_columns = {
+        column["name"]
+        for column in inspect(engine).get_columns("users")
+    }
+
     if "role" not in user_columns:
         with engine.begin() as connection:
             connection.execute(
-                text("ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT 'patient'")
+                text(
+                    "ALTER TABLE users "
+                    "ADD COLUMN role VARCHAR(20) DEFAULT 'patient'"
+                )
             )
-    with engine.begin() as connection:
-        connection.execute(
-            text("UPDATE users SET role = 'patient' WHERE role IS NULL OR role = ''")
-        )
+
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE users "
+                    "SET role = 'patient' "
+                    "WHERE role IS NULL OR role = ''"
+                )
+            )
+
 except Exception as role_schema_error:
-    print(f"Role schema initialization warning: {role_schema_error}")
+    print(
+        f"Role schema initialization warning: "
+        f"{role_schema_error}"
+    )
 
 
-def get_user_role(db: Session, user_id: str) -> str:
+# ============================================================
+# USER ROLE
+# ============================================================
+
+def get_user_role(
+    db: Session,
+    user_id: str,
+) -> str:
+
     try:
         value = db.execute(
-            text("SELECT role FROM users WHERE id = :user_id"),
-            {"user_id": user_id},
+            text(
+                "SELECT role "
+                "FROM users "
+                "WHERE id = :user_id"
+            ),
+            {
+                "user_id": user_id
+            },
         ).scalar_one_or_none()
-        return value if value in {"doctor", "patient"} else "patient"
+
+        if value in {"doctor", "patient"}:
+            return value
+
+        return "patient"
+
     except Exception:
         return "patient"
 
 
-def public_user(db: Session, user: models.User) -> dict:
+# ============================================================
+# PUBLIC USER RESPONSE
+# ============================================================
+
+def public_user(
+    db: Session,
+    user: models.User,
+) -> dict:
+
     return {
         "id": user.id,
         "name": user.name,
         "email": user.email,
-        "role": get_user_role(db, user.id),
-        "created_at": user.created_at.isoformat() if user.created_at else None,
+        "role": get_user_role(
+            db,
+            user.id,
+        ),
+        "created_at": (
+            user.created_at.isoformat()
+            if user.created_at
+            else None
+        ),
     }
 
 
 # ============================================================
-# FASTAPI APP
+# FASTAPI APPLICATION
 # ============================================================
 
 app = FastAPI(
     title="MEDXAI - Explainable MRI Intelligence API",
     description=(
         "Backend API for Alzheimer's MRI Disease Detection "
-        "using EfficientNetB0, Grad-CAM & LIME"
+        "using EfficientNetB0, Grad-CAM and LIME."
     ),
     version="1.0.0",
 )
-
 
 # ============================================================
 # CORS
 # ============================================================
 
-# ============================================================
-# CORS CONFIGURATION
-# ============================================================
+def _normalize_origin(value: str) -> str:
+    """Normalize CORS origins from environment variables.
 
-frontend_url = os.getenv(
-    "FRONTEND_URL",
-    "https://medxai-frontend.onrender.com"
-).strip().rstrip("/")
+    This also repairs accidental Markdown-style values such as:
+    [https://example.com](https://example.com)
+    which can otherwise cause browsers to reject CORS requests.
+    """
+
+    value = str(value or "").strip()
+
+    if not value:
+        return ""
+
+    # Remove surrounding quotes commonly introduced in env settings.
+    value = value.strip('\"\'')
+
+    # Convert Markdown link syntax to the actual origin.
+    if value.startswith("[") and "](" in value:
+        value = value[1:value.find("](")]
+
+    return value.strip().rstrip("/")
+
+
+frontend_url = _normalize_origin(
+    os.getenv(
+        "FRONTEND_URL",
+        "https://medxai-frontend.onrender.com",
+    )
+)
 
 configured_origins = os.getenv(
     "CORS_ORIGINS",
-    ""
+    "",
 ).strip()
 
+# Explicit origins used by the deployed frontend and local development.
 origins = [
-    # Production frontend
     frontend_url,
-
-    # Local development
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
+    "https://medxai-frontend.onrender.com",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
 ]
 
-# Add optional origins from Render environment variable
+# Add extra origins from the CORS_ORIGINS environment variable.
+# Commas, semicolons, and newlines are accepted.
 if configured_origins:
-    origins.extend(
-        origin.strip().rstrip("/")
-        for origin in configured_origins.split(",")
-        if origin.strip()
-    )
+    for raw_origin in configured_origins.replace(";", ",").replace("\n", ",").split(","):
+        normalized = _normalize_origin(raw_origin)
+        if normalized:
+            origins.append(normalized)
 
-# Remove duplicates while preserving order
-origins = list(dict.fromkeys(origins))
+# Remove duplicates and empty values while preserving order.
+origins = list(dict.fromkeys(
+    origin for origin in origins if origin
+))
 
 print("CORS allowed origins:", origins)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    # Also allow local development ports and Render frontend subdomains.
+    # This is useful when the frontend runs on localhost:3000 while the
+    # backend is deployed on Render.
+    allow_origin_regex=(
+        r"^https://([a-zA-Z0-9-]+\.)?onrender\.com$"
+        r"|^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
+    ),
     allow_credentials=True,
-    allow_methods=[
-        "GET",
-        "POST",
-        "PUT",
-        "PATCH",
-        "DELETE",
-        "OPTIONS",
-    ],
+    allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=[
         "Content-Disposition",
     ],
+    max_age=600,
 )
-# ============================================================
+
 # DIRECTORIES
 # ============================================================
 
@@ -170,22 +243,22 @@ BASE_DIR = os.path.dirname(
 
 UPLOAD_DIR = os.path.join(
     BASE_DIR,
-    "uploads"
+    "uploads",
 )
 
 REPORTS_DIR = os.path.join(
     BASE_DIR,
-    "reports"
+    "reports",
 )
 
 os.makedirs(
     UPLOAD_DIR,
-    exist_ok=True
+    exist_ok=True,
 )
 
 os.makedirs(
     REPORTS_DIR,
-    exist_ok=True
+    exist_ok=True,
 )
 
 
@@ -195,17 +268,20 @@ os.makedirs(
 
 app.mount(
     "/uploads",
-    StaticFiles(directory=UPLOAD_DIR),
+    StaticFiles(
+        directory=UPLOAD_DIR
+    ),
     name="uploads",
 )
 
 
 # ============================================================
-# HEALTH
+# HEALTH CHECK
 # ============================================================
 
 @app.get("/")
 def root():
+
     return {
         "status": "ok",
         "service": "MEDXAI FastAPI Engine",
@@ -214,6 +290,7 @@ def root():
 
 @app.get("/api/health")
 def health_check():
+
     return {
         "status": "ok",
         "service": "MEDXAI FastAPI Engine",
@@ -221,49 +298,85 @@ def health_check():
 
 
 # ============================================================
-# AUTH - REGISTER
+# AUTHENTICATION
+# REGISTER USER
 # ============================================================
 
-def _register_user(data: dict, db: Session, forced_role: str | None = None):
+def _register_user(
+    data: dict,
+    db: Session,
+    forced_role: Optional[str] = None,
+):
+
     name = data.get("name")
     email = data.get("email")
     password = data.get("password")
-    requested_role = forced_role or data.get("role", "patient")
+
+    requested_role = (
+        forced_role
+        or data.get(
+            "role",
+            "patient",
+        )
+    )
 
     if not name or not email or not password:
         raise HTTPException(
             status_code=400,
-            detail="Name, email, and password are required",
+            detail=(
+                "Name, email, and password "
+                "are required"
+            ),
         )
 
     name = str(name).strip()
     email = str(email).lower().strip()
     role = str(requested_role).lower().strip()
 
-    if role not in {"doctor", "patient"}:
+    if role not in {
+        "doctor",
+        "patient",
+    }:
         raise HTTPException(
             status_code=400,
-            detail="Role must be either doctor or patient",
+            detail=(
+                "Role must be either "
+                "doctor or patient"
+            ),
         )
 
     if len(name) < 2:
-        raise HTTPException(status_code=400, detail="Name must be at least 2 characters")
-
-    if len(password.encode("utf-8")) > 72:
         raise HTTPException(
             status_code=400,
-            detail="Password must be 72 bytes or less",
+            detail=(
+                "Name must be at least "
+                "2 characters"
+            ),
         )
 
     if len(password) < 6:
         raise HTTPException(
             status_code=400,
-            detail="Password must be at least 6 characters",
+            detail=(
+                "Password must be at least "
+                "6 characters"
+            ),
+        )
+
+    if len(password.encode("utf-8")) > 72:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Password must be "
+                "72 bytes or less"
+            ),
         )
 
     existing_user = (
         db.query(models.User)
-        .filter(models.User.email == email)
+        .filter(
+            models.User.email == email
+        )
         .first()
     )
 
@@ -273,80 +386,344 @@ def _register_user(data: dict, db: Session, forced_role: str | None = None):
             detail="Email already registered",
         )
 
-    user_id = str(uuid.uuid4())
-    hashed_pwd = auth.get_password_hash(password)
+    user_id = str(
+        uuid.uuid4()
+    )
 
-    # Insert the role with raw SQL so this remains compatible with the
-    # older SQLAlchemy User model that does not declare a role attribute.
     try:
+        hashed_password = (
+            auth.get_password_hash(
+                password
+            )
+        )
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Password hashing failed: "
+                f"{str(error)}"
+            ),
+        )
+
+    try:
+
         db.execute(
             text(
-                "INSERT INTO users (id, name, email, password_hash, role) "
-                "VALUES (:id, :name, :email, :password_hash, :role)"
+                "INSERT INTO users "
+                "(id, name, email, password_hash, role) "
+                "VALUES "
+                "(:id, :name, :email, "
+                ":password_hash, :role)"
             ),
             {
                 "id": user_id,
                 "name": name,
                 "email": email,
-                "password_hash": hashed_pwd,
+                "password_hash": hashed_password,
                 "role": role,
             },
         )
+
         db.commit()
+
     except Exception as error:
+
         db.rollback()
+
         raise HTTPException(
             status_code=500,
-            detail=f"Registration failed: {str(error)}",
+            detail=(
+                "Registration failed: "
+                f"{str(error)}"
+            ),
         )
 
-    user = db.query(models.User).filter(models.User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=500, detail="Registered user could not be loaded")
+    user = (
+        db.query(models.User)
+        .filter(
+            models.User.id == user_id
+        )
+        .first()
+    )
 
-    access_token = auth.create_access_token(
-        data={
-            "sub": user.id,
-            "email": user.email,
-            "role": role,
-        }
+    if not user:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Registered user "
+                "could not be loaded"
+            ),
+        )
+
+    access_token = (
+        auth.create_access_token(
+            data={
+                "sub": user.id,
+                "email": user.email,
+                "role": role,
+            }
+        )
     )
 
     return {
         "access_token": access_token,
         "token_type": "bearer",
-        "user": public_user(db, user),
+        "user": public_user(
+            db,
+            user,
+        ),
     }
 
+
+# ============================================================
+# GENERAL REGISTER
+# ============================================================
 
 @app.post("/auth/register")
 def register(
     data: dict,
     db: Session = Depends(get_db),
 ):
-    # Backward-compatible endpoint. New clients can send role=doctor/patient.
-    # If no role is supplied, patient is the safe default.
-    return _register_user(data, db)
 
+    return _register_user(
+        data,
+        db,
+    )
+
+
+# ============================================================
+# PATIENT REGISTER
+# ============================================================
 
 @app.post("/auth/patient/register")
 def patient_register(
     data: dict,
     db: Session = Depends(get_db),
 ):
-    return _register_user(data, db, "patient")
 
+    return _register_user(
+        data,
+        db,
+        "patient",
+    )
+
+
+# ============================================================
+# DOCTOR REGISTER
+# ============================================================
 
 @app.post("/auth/doctor/register")
 def doctor_register(
     data: dict,
     db: Session = Depends(get_db),
 ):
-    return _register_user(data, db, "doctor")
+
+    return _register_user(
+        data,
+        db,
+        "doctor",
+    )
 
 
 # ============================================================
-# AUTH - LOGIN
+# LOGIN HELPER
+# ============================================================
+
+async def _perform_login(
+    request: Request,
+    db: Session,
+    required_role: Optional[str] = None,
+):
+
+    content_type = (
+        request.headers
+        .get(
+            "content-type",
+            "",
+        )
+        .lower()
+    )
+
+    if "application/json" in content_type:
+
+        try:
+            data = await request.json()
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid JSON body",
+            )
+
+        email = str(
+            data.get(
+                "email",
+                "",
+            )
+        ).lower().strip()
+
+        password = str(
+            data.get(
+                "password",
+                "",
+            )
+        )
+
+        requested_role = str(
+            data.get(
+                "role",
+                "",
+            )
+        ).lower().strip()
+
+    else:
+
+        try:
+            form = await request.form()
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid form data",
+            )
+
+        email = str(
+            form.get(
+                "username",
+                form.get(
+                    "email",
+                    "",
+                ),
+            )
+        ).lower().strip()
+
+        password = str(
+            form.get(
+                "password",
+                "",
+            )
+        )
+
+        requested_role = str(
+            form.get(
+                "role",
+                "",
+            )
+        ).lower().strip()
+
+    if not email or not password:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Email and password "
+                "are required"
+            ),
+        )
+
+    user = (
+        db.query(models.User)
+        .filter(
+            models.User.email == email
+        )
+        .first()
+    )
+
+    if not user:
+
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Invalid email or password"
+            ),
+        )
+
+    try:
+
+        password_valid = (
+            auth.verify_password(
+                password,
+                user.password_hash,
+            )
+        )
+
+    except Exception as error:
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Password verification "
+                f"failed: {str(error)}"
+            ),
+        )
+
+    if not password_valid:
+
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Invalid email or password"
+            ),
+        )
+
+    role = get_user_role(
+        db,
+        user.id,
+    )
+
+    expected_role = (
+        required_role
+        or requested_role
+    )
+
+    if expected_role in {
+        "doctor",
+        "patient",
+    }:
+
+        if role != expected_role:
+
+            if expected_role == "doctor":
+
+                message = (
+                    "This account is a "
+                    "patient account. "
+                    "Please use Patient Login."
+                )
+
+            else:
+
+                message = (
+                    "This account is a "
+                    "doctor account. "
+                    "Please use Doctor Login."
+                )
+
+            raise HTTPException(
+                status_code=403,
+                detail=message,
+            )
+
+    access_token = (
+        auth.create_access_token(
+            data={
+                "sub": user.id,
+                "email": user.email,
+                "role": role,
+            }
+        )
+    )
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": public_user(
+            db,
+            user,
+        ),
+    }
+
+
+# ============================================================
+# GENERAL LOGIN
 # ============================================================
 
 @app.post("/auth/login")
@@ -354,117 +731,49 @@ async def login(
     request: Request,
     db: Session = Depends(get_db),
 ):
-    # Accept both the JSON body used by the React frontend and the
-    # application/x-www-form-urlencoded format used by OAuth clients.
-    content_type = request.headers.get("content-type", "").lower()
 
-    if "application/json" in content_type:
-        data = await request.json()
-        email = str(data.get("email", "")).lower().strip()
-        password = str(data.get("password", ""))
-        requested_role = str(data.get("role", "")).lower().strip()
-    else:
-        form = await request.form()
-        email = str(form.get("username", form.get("email", ""))).lower().strip()
-        password = str(form.get("password", ""))
-        requested_role = str(form.get("role", "")).lower().strip()
-
-    if not email or not password:
-        raise HTTPException(
-            status_code=400,
-            detail="Email and password are required",
-        )
-
-    user = (
-        db.query(models.User)
-        .filter(models.User.email == email)
-        .first()
+    return await _perform_login(
+        request,
+        db,
     )
-
-    if not user or not auth.verify_password(password, user.password_hash):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid email or password",
-        )
-
-    role = get_user_role(db, user.id)
-
-    if requested_role and requested_role in {"doctor", "patient"} and role != requested_role:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "This account is a patient account. Please use Patient Login."
-                if requested_role == "doctor"
-                else "This account is a doctor account. Please use Doctor Login."
-            ),
-        )
-
-    access_token = auth.create_access_token(
-        data={
-            "sub": user.id,
-            "email": user.email,
-            "role": role,
-        }
-    )
-
-    return {
-        "access_token": access_token,
-        "token_type": "bearer",
-        "user": public_user(db, user),
-    }
-
-
-@app.post("/auth/doctor/login")
-async def doctor_login(request: Request, db: Session = Depends(get_db)):
-    return await _role_login(request, db, "doctor")
-
-
-@app.post("/auth/patient/login")
-async def patient_login(request: Request, db: Session = Depends(get_db)):
-    return await _role_login(request, db, "patient")
-
-
-async def _role_login(request: Request, db: Session, required_role: str):
-    content_type = request.headers.get("content-type", "").lower()
-    if "application/json" in content_type:
-        data = await request.json()
-        email = str(data.get("email", "")).lower().strip()
-        password = str(data.get("password", ""))
-    else:
-        form = await request.form()
-        email = str(form.get("username", form.get("email", ""))).lower().strip()
-        password = str(form.get("password", ""))
-
-    if not email or not password:
-        raise HTTPException(status_code=400, detail="Email and password are required")
-
-    user = db.query(models.User).filter(models.User.email == email).first()
-    if not user or not auth.verify_password(password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-
-    role = get_user_role(db, user.id)
-    if role != required_role:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "This account is a patient account. Please use Patient Login."
-                if required_role == "doctor"
-                else "This account is a doctor account. Please use Doctor Login."
-            ),
-        )
-
-    token = auth.create_access_token(
-        data={"sub": user.id, "email": user.email, "role": role}
-    )
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "user": public_user(db, user),
-    }
 
 
 # ============================================================
-# AUTH - CURRENT USER
+# DOCTOR LOGIN
+# ============================================================
+
+@app.post("/auth/doctor/login")
+async def doctor_login(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+
+    return await _perform_login(
+        request,
+        db,
+        "doctor",
+    )
+
+
+# ============================================================
+# PATIENT LOGIN
+# ============================================================
+
+@app.post("/auth/patient/login")
+async def patient_login(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+
+    return await _perform_login(
+        request,
+        db,
+        "patient",
+    )
+
+
+# ============================================================
+# CURRENT USER
 # ============================================================
 
 @app.get("/auth/me")
@@ -474,11 +783,15 @@ def get_me(
     ),
     db: Session = Depends(get_db),
 ):
-    return public_user(db, current_user)
+
+    return public_user(
+        db,
+        current_user,
+    )
 
 
 # ============================================================
-# AUTH - LOGOUT
+# LOGOUT
 # ============================================================
 
 @app.post("/auth/logout")
@@ -489,12 +802,14 @@ def logout(
 ):
 
     return {
-        "message": "Logged out successfully",
+        "message": (
+            "Logged out successfully"
+        ),
     }
 
 
 # ============================================================
-# AUTH - CHANGE PASSWORD
+# CHANGE PASSWORD
 # ============================================================
 
 @app.post("/auth/change-password")
@@ -506,43 +821,70 @@ def change_password(
     db: Session = Depends(get_db),
 ):
 
-    current_pwd = data.get(
+    current_password = data.get(
         "current_password"
     )
 
-    new_pwd = data.get(
+    new_password = data.get(
         "new_password"
     )
 
-    if not current_pwd or not new_pwd:
+    if not current_password or not new_password:
+
         raise HTTPException(
             status_code=400,
-            detail="Current and new password required",
+            detail=(
+                "Current and new password "
+                "are required"
+            ),
         )
 
-    if len(new_pwd.encode("utf-8")) > 72:
+    if len(new_password) < 6:
+
         raise HTTPException(
             status_code=400,
-            detail="New password must be 72 bytes or less",
+            detail=(
+                "New password must be "
+                "at least 6 characters"
+            ),
+        )
+
+    if len(
+        new_password.encode("utf-8")
+    ) > 72:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "New password must be "
+                "72 bytes or less"
+            ),
         )
 
     if not auth.verify_password(
-        current_pwd,
+        current_password,
         current_user.password_hash,
     ):
+
         raise HTTPException(
             status_code=401,
-            detail="Current password incorrect",
+            detail=(
+                "Current password incorrect"
+            ),
         )
 
     current_user.password_hash = (
-        auth.get_password_hash(new_pwd)
+        auth.get_password_hash(
+            new_password
+        )
     )
 
     db.commit()
 
     return {
-        "message": "Password updated successfully",
+        "message": (
+            "Password updated successfully"
+        ),
     }
 
 
@@ -557,7 +899,11 @@ def get_profile(
     ),
     db: Session = Depends(get_db),
 ):
-    return public_user(db, current_user)
+
+    return public_user(
+        db,
+        current_user,
+    )
 
 
 # ============================================================
@@ -577,10 +923,28 @@ def update_profile(
     email = data.get("email")
 
     if name:
-        current_user.name = name.strip()
+
+        name = str(name).strip()
+
+        if len(name) < 2:
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Name must be at least "
+                    "2 characters"
+                ),
+            )
+
+        current_user.name = name
 
     if email:
-        email = email.lower().strip()
+
+        email = (
+            str(email)
+            .lower()
+            .strip()
+        )
 
         if email != current_user.email:
 
@@ -588,15 +952,19 @@ def update_profile(
                 db.query(models.User)
                 .filter(
                     models.User.email == email,
-                    models.User.id != current_user.id,
+                    models.User.id
+                    != current_user.id,
                 )
                 .first()
             )
 
             if existing_user:
+
                 raise HTTPException(
                     status_code=400,
-                    detail="Email already registered",
+                    detail=(
+                        "Email already registered"
+                    ),
                 )
 
             current_user.email = email
@@ -604,11 +972,14 @@ def update_profile(
     db.commit()
     db.refresh(current_user)
 
-    return public_user(db, current_user)
+    return public_user(
+        db,
+        current_user,
+    )
 
 
 # ============================================================
-# MRI PREDICTION + EXPLAINABILITY
+# MRI PREDICTION
 # ============================================================
 
 @app.post("/predict")
@@ -625,6 +996,7 @@ async def predict(
     # --------------------------------------------------------
 
     if not file.filename:
+
         raise HTTPException(
             status_code=400,
             detail="No file selected",
@@ -643,6 +1015,7 @@ async def predict(
     )[1].lower()
 
     if extension not in allowed_extensions:
+
         raise HTTPException(
             status_code=400,
             detail=(
@@ -652,10 +1025,12 @@ async def predict(
         )
 
     # --------------------------------------------------------
-    # UNIQUE ANALYSIS ID
+    # ANALYSIS ID
     # --------------------------------------------------------
 
-    analysis_id = str(uuid.uuid4())
+    analysis_id = str(
+        uuid.uuid4()
+    )
 
     safe_filename = os.path.basename(
         file.filename
@@ -667,30 +1042,33 @@ async def predict(
 
     file_path = os.path.join(
         UPLOAD_DIR,
-        filename
+        filename,
     )
 
     # --------------------------------------------------------
-    # SAVE ORIGINAL MRI
+    # SAVE MRI
     # --------------------------------------------------------
 
     try:
 
         with open(
             file_path,
-            "wb"
+            "wb",
         ) as buffer:
 
             shutil.copyfileobj(
                 file.file,
-                buffer
+                buffer,
             )
 
-    except Exception as e:
+    except Exception as error:
 
         raise HTTPException(
             status_code=500,
-            detail=f"File upload failed: {str(e)}",
+            detail=(
+                "File upload failed: "
+                f"{str(error)}"
+            ),
         )
 
     # --------------------------------------------------------
@@ -699,22 +1077,31 @@ async def predict(
 
     try:
 
-        prediction_result = predict_mri(
-            file_path
+        prediction_result = (
+            predict_mri(
+                file_path
+            )
         )
 
-    except Exception as e:
+    except Exception as error:
 
         if os.path.exists(file_path):
-            os.remove(file_path)
+
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
 
         raise HTTPException(
             status_code=500,
-            detail=f"MRI prediction failed: {str(e)}",
+            detail=(
+                "MRI prediction failed: "
+                f"{str(error)}"
+            ),
         )
 
     # --------------------------------------------------------
-    # EXPLANATION PATHS
+    # EXPLANATION FILE PATHS
     # --------------------------------------------------------
 
     gradcam_filename = (
@@ -727,16 +1114,16 @@ async def predict(
 
     gradcam_path = os.path.join(
         UPLOAD_DIR,
-        gradcam_filename
+        gradcam_filename,
     )
 
     lime_path = os.path.join(
         UPLOAD_DIR,
-        lime_filename
+        lime_filename,
     )
 
     # --------------------------------------------------------
-    # REMOVE OLD FILES
+    # REMOVE EXISTING EXPLANATION FILES
     # --------------------------------------------------------
 
     for explanation_file in [
@@ -748,9 +1135,12 @@ async def predict(
             explanation_file
         ):
 
-            os.remove(
-                explanation_file
-            )
+            try:
+                os.remove(
+                    explanation_file
+                )
+            except Exception:
+                pass
 
     # --------------------------------------------------------
     # LOAD MODEL
@@ -760,11 +1150,14 @@ async def predict(
 
         model = get_model()
 
-    except Exception as e:
+    except Exception as error:
 
         raise HTTPException(
             status_code=500,
-            detail=f"Model loading failed: {str(e)}",
+            detail=(
+                "Model loading failed: "
+                f"{str(error)}"
+            ),
         )
 
     # --------------------------------------------------------
@@ -786,7 +1179,8 @@ async def predict(
         ):
 
             raise RuntimeError(
-                "Grad-CAM output file was not created"
+                "Grad-CAM output file "
+                "was not created"
             )
 
         if os.path.getsize(
@@ -794,18 +1188,26 @@ async def predict(
         ) <= 100:
 
             raise RuntimeError(
-                "Grad-CAM output file is empty"
+                "Grad-CAM output file "
+                "is empty"
             )
 
-    except Exception as e:
+    except Exception as error:
 
-        gradcam_error = str(e)
+        gradcam_error = str(error)
 
         print(
             "=================================================="
         )
-        print("GRAD-CAM ERROR:")
-        print(gradcam_error)
+
+        print(
+            "GRAD-CAM ERROR:"
+        )
+
+        print(
+            gradcam_error
+        )
+
         print(
             "=================================================="
         )
@@ -813,123 +1215,106 @@ async def predict(
     # --------------------------------------------------------
     # LIME
     # --------------------------------------------------------
+    # LIME is intentionally deferred from /predict.
+    # This prevents excessive memory usage on small
+    # Render instances.
+    #
+    # It can be generated using /explain/lime.
 
-    lime_error = None
+    lime_error = (
+        "LIME generation deferred"
+    )
 
-    try:
-
-        generate_lime_explanation(
-            model,
-            file_path,
-            lime_path,
-        )
-
-        if not os.path.exists(
-            lime_path
-        ):
-
-            raise RuntimeError(
-                "LIME output file was not created"
-            )
-
-        if os.path.getsize(
-            lime_path
-        ) <= 100:
-
-            raise RuntimeError(
-                "LIME output file is empty"
-            )
-
-    except Exception as e:
-
-        lime_error = str(e)
-
-        print(
-            "=================================================="
-        )
-        print("LIME ERROR:")
-        print(lime_error)
-        print(
-            "=================================================="
-        )
+    lime_url = None
 
     # --------------------------------------------------------
-    # EXPLANATION URLS
+    # GRAD-CAM URL
     # --------------------------------------------------------
 
     gradcam_url = None
-    lime_url = None
 
     if (
         gradcam_error is None
-        and os.path.exists(gradcam_path)
+        and os.path.exists(
+            gradcam_path
+        )
     ):
 
         gradcam_url = (
             f"/uploads/{gradcam_filename}"
         )
 
-    if (
-        lime_error is None
-        and os.path.exists(lime_path)
-    ):
-
-        lime_url = (
-            f"/uploads/{lime_filename}"
-        )
-
     # --------------------------------------------------------
     # DATABASE RECORD
-    # CURRENT USER ID
     # --------------------------------------------------------
-
-    analysis_record = models.Analysis(
-        id=analysis_id,
-
-        user_id=current_user.id,
-
-        filename=safe_filename,
-
-        prediction=(
-            prediction_result["prediction"]
-        ),
-
-        confidence=(
-            prediction_result["confidence"]
-        ),
-
-        confidence_percentage=(
-            prediction_result[
-                "confidence_percentage"
-            ]
-        ),
-
-        probabilities=(
-            prediction_result["probabilities"]
-        ),
-
-        gradcam_url=gradcam_url,
-
-        lime_url=lime_url,
-
-        image_url=(
-            f"/uploads/{filename}"
-        ),
-    )
 
     try:
 
-        db.add(analysis_record)
-        db.commit()
-        db.refresh(analysis_record)
+        probabilities = (
+            prediction_result.get(
+                "probabilities",
+                {},
+            )
+        )
 
-    except Exception as e:
+        analysis_record = (
+            models.Analysis(
+                id=analysis_id,
+
+                user_id=current_user.id,
+
+                filename=safe_filename,
+
+                prediction=(
+                    prediction_result[
+                        "prediction"
+                    ]
+                ),
+
+                confidence=(
+                    prediction_result[
+                        "confidence"
+                    ]
+                ),
+
+                confidence_percentage=(
+                    prediction_result[
+                        "confidence_percentage"
+                    ]
+                ),
+
+                probabilities=probabilities,
+
+                gradcam_url=gradcam_url,
+
+                lime_url=lime_url,
+
+                image_url=(
+                    f"/uploads/{filename}"
+                ),
+            )
+        )
+
+        db.add(
+            analysis_record
+        )
+
+        db.commit()
+
+        db.refresh(
+            analysis_record
+        )
+
+    except Exception as error:
 
         db.rollback()
 
         raise HTTPException(
             status_code=500,
-            detail=f"Database save failed: {str(e)}",
+            detail=(
+                "Database save failed: "
+                f"{str(error)}"
+            ),
         )
 
     # --------------------------------------------------------
@@ -943,11 +1328,15 @@ async def predict(
         "filename": safe_filename,
 
         "prediction": (
-            prediction_result["prediction"]
+            prediction_result[
+                "prediction"
+            ]
         ),
 
         "confidence": (
-            prediction_result["confidence"]
+            prediction_result[
+                "confidence"
+            ]
         ),
 
         "confidence_percentage": (
@@ -957,7 +1346,9 @@ async def predict(
         ),
 
         "probabilities": (
-            prediction_result["probabilities"]
+            prediction_result[
+                "probabilities"
+            ]
         ),
 
         "image_url": (
@@ -976,25 +1367,27 @@ async def predict(
                 else "failed"
             ),
 
-            "lime": (
-                "success"
-                if lime_url
-                else "failed"
-            ),
+            "lime": "deferred",
         },
     }
 
     if gradcam_error:
-        response["gradcam_error"] = gradcam_error
+
+        response[
+            "gradcam_error"
+        ] = gradcam_error
 
     if lime_error:
-        response["lime_error"] = lime_error
+
+        response[
+            "lime_error"
+        ] = lime_error
 
     return response
 
 
 # ============================================================
-# ANALYSES - CURRENT USER ONLY
+# ANALYSES - CURRENT USER
 # ============================================================
 
 @app.get("/analyses")
@@ -1021,8 +1414,7 @@ def get_analyses(
 
 
 # ============================================================
-# ANALYSIS - SINGLE
-# CURRENT USER ONLY
+# SINGLE ANALYSIS
 # ============================================================
 
 @app.get("/analyses/{id}")
@@ -1055,8 +1447,7 @@ def get_analysis_by_id(
 
 
 # ============================================================
-# ANALYSIS - DELETE
-# CURRENT USER ONLY
+# DELETE ANALYSIS
 # ============================================================
 
 @app.delete("/analyses/{id}")
@@ -1085,74 +1476,111 @@ def delete_analysis(
             detail="Analysis not found",
         )
 
-    # Original MRI
+    # --------------------------------------------------------
+    # DELETE ORIGINAL MRI
+    # --------------------------------------------------------
+
     if record.image_url:
 
         image_filename = (
             record.image_url
-            .replace("/uploads/", "")
+            .replace(
+                "/uploads/",
+                "",
+            )
         )
 
         image_path = os.path.join(
             UPLOAD_DIR,
-            image_filename
+            image_filename,
         )
 
-        if os.path.exists(image_path):
-            os.remove(image_path)
+        if os.path.exists(
+            image_path
+        ):
 
-    # Grad-CAM
+            try:
+                os.remove(
+                    image_path
+                )
+            except Exception:
+                pass
+
+    # --------------------------------------------------------
+    # DELETE GRAD-CAM
+    # --------------------------------------------------------
+
     if record.gradcam_url:
 
         gradcam_filename = (
             record.gradcam_url
-            .replace("/uploads/", "")
+            .replace(
+                "/uploads/",
+                "",
+            )
         )
 
         gradcam_path = os.path.join(
             UPLOAD_DIR,
-            gradcam_filename
+            gradcam_filename,
         )
 
         if os.path.exists(
             gradcam_path
         ):
 
-            os.remove(
-                gradcam_path
-            )
+            try:
+                os.remove(
+                    gradcam_path
+                )
+            except Exception:
+                pass
 
-    # LIME
+    # --------------------------------------------------------
+    # DELETE LIME
+    # --------------------------------------------------------
+
     if record.lime_url:
 
         lime_filename = (
             record.lime_url
-            .replace("/uploads/", "")
+            .replace(
+                "/uploads/",
+                "",
+            )
         )
 
         lime_path = os.path.join(
             UPLOAD_DIR,
-            lime_filename
+            lime_filename,
         )
 
         if os.path.exists(
             lime_path
         ):
 
-            os.remove(
-                lime_path
-            )
+            try:
+                os.remove(
+                    lime_path
+                )
+            except Exception:
+                pass
 
-    db.delete(record)
+    db.delete(
+        record
+    )
+
     db.commit()
 
     return {
-        "message": "Analysis deleted successfully",
+        "message": (
+            "Analysis deleted successfully"
+        ),
     }
 
 
 # ============================================================
-# DASHBOARD - CURRENT USER ONLY
+# DASHBOARD STATISTICS
 # ============================================================
 
 @app.get("/dashboard/stats")
@@ -1175,34 +1603,49 @@ def get_dashboard_stats(
         .all()
     )
 
-    total = len(all_analyses)
-
-    avg_conf = (
-        sum(
-            a.confidence_percentage
-            for a in all_analyses
-        ) / total
-        if total > 0
-        else 0.0
+    total = len(
+        all_analyses
     )
 
-    recent = all_analyses[:5]
+    if total > 0:
 
-    latest = (
+        avg_confidence = (
+            sum(
+                float(
+                    a.confidence_percentage
+                    or 0
+                )
+                for a in all_analyses
+            )
+            / total
+        )
+
+    else:
+
+        avg_confidence = 0.0
+
+    recent = (
+        all_analyses[:5]
+    )
+
+    latest_prediction = (
         recent[0].prediction
         if recent
         else None
     )
 
     return {
+
         "total_analyses": total,
 
         "average_confidence": round(
-            avg_conf,
-            2
+            avg_confidence,
+            2,
         ),
 
-        "latest_prediction": latest,
+        "latest_prediction": (
+            latest_prediction
+        ),
 
         "recent": recent,
     }
@@ -1210,12 +1653,11 @@ def get_dashboard_stats(
 
 # ============================================================
 # LIME EXPLANATION
-# CURRENT USER ONLY
 # ============================================================
 
 @app.post("/explain/lime")
 def get_lime_explain(
-    data: dict = None,
+    data: Optional[dict] = None,
     current_user: models.User = Depends(
         auth.get_current_user
     ),
@@ -1228,6 +1670,10 @@ def get_lime_explain(
     analysis_id = data.get(
         "analysis_id"
     )
+
+    # --------------------------------------------------------
+    # FIND ANALYSIS
+    # --------------------------------------------------------
 
     if analysis_id:
 
@@ -1261,18 +1707,180 @@ def get_lime_explain(
 
         raise HTTPException(
             status_code=404,
-            detail="Analysis record not found",
+            detail=(
+                "Analysis record "
+                "not found"
+            ),
         )
 
+    # --------------------------------------------------------
+    # FIND ORIGINAL IMAGE
+    # --------------------------------------------------------
+
+    if not record.image_url:
+
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Original MRI image "
+                "not found"
+            ),
+        )
+
+    image_filename = (
+        record.image_url
+        .replace(
+            "/uploads/",
+            "",
+        )
+    )
+
+    image_path = os.path.join(
+        UPLOAD_DIR,
+        image_filename,
+    )
+
+    if not os.path.exists(
+        image_path
+    ):
+
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Original MRI file "
+                "not found"
+            ),
+        )
+
+    # --------------------------------------------------------
+    # LIME OUTPUT
+    # --------------------------------------------------------
+
+    lime_filename = (
+        f"lime_{image_filename}"
+    )
+
+    lime_path = os.path.join(
+        UPLOAD_DIR,
+        lime_filename,
+    )
+
+    # --------------------------------------------------------
+    # LOAD MODEL
+    # --------------------------------------------------------
+
+    try:
+
+        model = get_model()
+
+    except Exception as error:
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Model loading failed: "
+                f"{str(error)}"
+            ),
+        )
+
+    # --------------------------------------------------------
+    # GENERATE LIME
+    # --------------------------------------------------------
+
+    try:
+
+        result = generate_lime_explanation(
+            model,
+            image_path,
+            lime_path,
+        )
+
+        # Some implementations return
+        # a path while others simply
+        # create the file.
+
+        if isinstance(
+            result,
+            str,
+        ):
+
+            if os.path.exists(
+                result
+            ):
+
+                lime_path = result
+
+        if not os.path.exists(
+            lime_path
+        ):
+
+            raise RuntimeError(
+                "LIME output file "
+                "was not created"
+            )
+
+        if os.path.getsize(
+            lime_path
+        ) <= 100:
+
+            raise RuntimeError(
+                "LIME output file "
+                "is empty"
+            )
+
+    except Exception as error:
+
+        print(
+            "=================================================="
+        )
+
+        print(
+            "LIME ERROR:"
+        )
+
+        print(
+            str(error)
+        )
+
+        print(
+            "=================================================="
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "LIME generation failed: "
+                f"{str(error)}"
+            ),
+        )
+
+    # --------------------------------------------------------
+    # UPDATE DATABASE
+    # --------------------------------------------------------
+
+    record.lime_url = (
+        f"/uploads/{lime_filename}"
+    )
+
+    db.commit()
+    db.refresh(
+        record
+    )
+
     return {
+
         "analysis_id": record.id,
-        "url": record.lime_url,
+
+        "url": (
+            f"/uploads/{lime_filename}"
+        ),
+
         "features": [],
     }
 
 
 # ============================================================
-# REPORTS - CURRENT USER ONLY
+# REPORTS - CURRENT USER
 # ============================================================
 
 @app.get("/reports")
@@ -1323,9 +1931,9 @@ def generate_pdf_report(
         ParagraphStyle,
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # DOCUMENT
-    # ========================================================
+    # --------------------------------------------------------
 
     doc = SimpleDocTemplate(
         pdf_path,
@@ -1336,19 +1944,23 @@ def generate_pdf_report(
         bottomMargin=36,
     )
 
-    styles = getSampleStyleSheet()
+    styles = (
+        getSampleStyleSheet()
+    )
 
     story = []
 
-    # ========================================================
-    # CUSTOM STYLES
-    # ========================================================
+    # --------------------------------------------------------
+    # STYLES
+    # --------------------------------------------------------
 
     title_style = ParagraphStyle(
         "DocTitle",
         parent=styles["Heading1"],
         fontSize=18,
-        textColor=colors.HexColor("#0284c7"),
+        textColor=colors.HexColor(
+            "#0284c7"
+        ),
         spaceAfter=12,
     )
 
@@ -1356,7 +1968,9 @@ def generate_pdf_report(
         "Section",
         parent=styles["Heading2"],
         fontSize=13,
-        textColor=colors.HexColor("#0f172a"),
+        textColor=colors.HexColor(
+            "#0f172a"
+        ),
         spaceBefore=8,
         spaceAfter=6,
     )
@@ -1366,7 +1980,9 @@ def generate_pdf_report(
         parent=styles["BodyText"],
         fontSize=9.5,
         leading=14,
-        textColor=colors.HexColor("#334155"),
+        textColor=colors.HexColor(
+            "#334155"
+        ),
         spaceAfter=8,
     )
 
@@ -1375,7 +1991,9 @@ def generate_pdf_report(
         parent=styles["BodyText"],
         fontSize=9.5,
         leading=14,
-        textColor=colors.HexColor("#1e293b"),
+        textColor=colors.HexColor(
+            "#1e293b"
+        ),
         leftIndent=8,
         spaceAfter=6,
     )
@@ -1385,12 +2003,14 @@ def generate_pdf_report(
         parent=styles["Italic"],
         fontSize=8,
         leading=11,
-        textColor=colors.HexColor("#64748b"),
+        textColor=colors.HexColor(
+            "#64748b"
+        ),
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # TITLE
-    # ========================================================
+    # --------------------------------------------------------
 
     story.append(
         Paragraph(
@@ -1403,48 +2023,72 @@ def generate_pdf_report(
         Spacer(1, 10)
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # PROBABILITIES
-    # ========================================================
+    # --------------------------------------------------------
 
-    probs = analysis.probabilities or {}
+    probabilities = (
+        analysis.probabilities
+        or {}
+    )
 
-    if isinstance(probs, str):
+    if isinstance(
+        probabilities,
+        str,
+    ):
 
         try:
-            probs = json.loads(probs)
+
+            probabilities = (
+                json.loads(
+                    probabilities
+                )
+            )
 
         except Exception:
-            probs = {}
+
+            probabilities = {}
 
     probability_items = []
 
-    for key, value in probs.items():
+    if isinstance(
+        probabilities,
+        dict,
+    ):
 
-        try:
-            numeric_value = float(value)
+        for key, value in (
+            probabilities.items()
+        ):
 
-            if numeric_value > 1:
-                numeric_value = numeric_value / 100
+            try:
 
-        except Exception:
-            numeric_value = 0.0
+                numeric_value = float(
+                    value
+                )
 
-        probability_items.append(
-            (
-                str(key),
-                numeric_value,
+                if numeric_value > 1:
+
+                    numeric_value /= 100
+
+            except Exception:
+
+                numeric_value = 0.0
+
+            probability_items.append(
+                (
+                    str(key),
+                    numeric_value,
+                )
             )
-        )
 
     probability_items.sort(
-        key=lambda x: x[1],
+        key=lambda item: item[1],
         reverse=True,
     )
 
-    # ========================================================
-    # ACTUAL PREDICTION
-    # ========================================================
+    # --------------------------------------------------------
+    # PREDICTION
+    # --------------------------------------------------------
 
     prediction = str(
         getattr(
@@ -1462,22 +2106,25 @@ def generate_pdf_report(
                 "confidence_percentage",
                 0,
             )
+            or 0
         )
 
     except Exception:
 
         confidence = 0.0
 
-    # ========================================================
+    # --------------------------------------------------------
     # REPORT INFORMATION
-    # ========================================================
+    # --------------------------------------------------------
 
     info_data = [
+
         [
             Paragraph(
                 "<b>Report ID:</b>",
                 styles["Normal"],
             ),
+
             Paragraph(
                 str(report_id),
                 styles["Normal"],
@@ -1489,6 +2136,7 @@ def generate_pdf_report(
                 "<b>Date/Time:</b>",
                 styles["Normal"],
             ),
+
             Paragraph(
                 str(
                     getattr(
@@ -1506,6 +2154,7 @@ def generate_pdf_report(
                 "<b>Scan Filename:</b>",
                 styles["Normal"],
             ),
+
             Paragraph(
                 str(
                     getattr(
@@ -1523,6 +2172,7 @@ def generate_pdf_report(
                 "<b>Diagnosis Classification:</b>",
                 styles["Normal"],
             ),
+
             Paragraph(
                 f"<b>{prediction}</b>",
                 styles["Normal"],
@@ -1534,6 +2184,7 @@ def generate_pdf_report(
                 "<b>Model Confidence:</b>",
                 styles["Normal"],
             ),
+
             Paragraph(
                 f"{confidence:.2f}%",
                 styles["Normal"],
@@ -1543,51 +2194,63 @@ def generate_pdf_report(
 
     info_table = Table(
         info_data,
-        colWidths=[160, 380],
+        colWidths=[
+            160,
+            380,
+        ],
     )
 
     info_table.setStyle(
-        TableStyle([
-            (
-                "BACKGROUND",
-                (0, 0),
-                (-1, -1),
-                colors.HexColor("#f8fafc"),
-            ),
+        TableStyle(
+            [
 
-            (
-                "GRID",
-                (0, 0),
-                (-1, -1),
-                0.5,
-                colors.HexColor("#cbd5e1"),
-            ),
+                (
+                    "BACKGROUND",
+                    (0, 0),
+                    (-1, -1),
+                    colors.HexColor(
+                        "#f8fafc"
+                    ),
+                ),
 
-            (
-                "PADDING",
-                (0, 0),
-                (-1, -1),
-                6,
-            ),
+                (
+                    "GRID",
+                    (0, 0),
+                    (-1, -1),
+                    0.5,
+                    colors.HexColor(
+                        "#cbd5e1"
+                    ),
+                ),
 
-            (
-                "VALIGN",
-                (0, 0),
-                (-1, -1),
-                "TOP",
-            ),
-        ])
+                (
+                    "PADDING",
+                    (0, 0),
+                    (-1, -1),
+                    6,
+                ),
+
+                (
+                    "VALIGN",
+                    (0, 0),
+                    (-1, -1),
+                    "TOP",
+                ),
+            ]
+        )
     )
 
-    story.append(info_table)
+    story.append(
+        info_table
+    )
 
     story.append(
         Spacer(1, 15)
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # PREDICTION SUMMARY
-    # ========================================================
+    # --------------------------------------------------------
 
     story.append(
         Paragraph(
@@ -1599,39 +2262,47 @@ def generate_pdf_report(
     if confidence >= 80:
 
         confidence_description = (
-            "The model produced a high-confidence classification "
+            "The model produced a "
+            "high-confidence classification "
             "for the submitted MRI image."
         )
 
     elif confidence >= 60:
 
         confidence_description = (
-            "The model produced a moderate-to-high confidence "
-            "classification. The result should be interpreted "
-            "together with the probability distribution and "
+            "The model produced a "
+            "moderate-to-high confidence "
+            "classification. The result should "
+            "be interpreted together with the "
+            "probability distribution and "
             "explainability outputs."
         )
 
     elif confidence >= 40:
 
         confidence_description = (
-            "The model produced an intermediate-confidence "
-            "classification. The probability distribution indicates "
-            "that alternative classes should also be considered."
+            "The model produced an "
+            "intermediate-confidence "
+            "classification. The probability "
+            "distribution indicates that "
+            "alternative classes should also "
+            "be considered."
         )
 
     else:
 
         confidence_description = (
-            "The model produced a relatively low-confidence "
-            "classification, indicating substantial uncertainty "
+            "The model produced a relatively "
+            "low-confidence classification, "
+            "indicating substantial uncertainty "
             "in the prediction."
         )
 
     prediction_text = (
-        f"The MEDXAI EfficientNetB0 model classified the submitted "
-        f"MRI image as <b>{prediction}</b> with a model confidence "
-        f"of <b>{confidence:.2f}%</b>. "
+        "The MEDXAI EfficientNetB0 model "
+        "classified the submitted MRI image "
+        f"as <b>{prediction}</b> with a model "
+        f"confidence of <b>{confidence:.2f}%</b>. "
         f"{confidence_description}"
     )
 
@@ -1642,9 +2313,9 @@ def generate_pdf_report(
         )
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # PROBABILITY ANALYSIS
-    # ========================================================
+    # --------------------------------------------------------
 
     story.append(
         Paragraph(
@@ -1655,15 +2326,20 @@ def generate_pdf_report(
 
     if probability_items:
 
-        top_class, top_probability = probability_items[0]
+        top_class, top_probability = (
+            probability_items[0]
+        )
 
         probability_text = (
-            f"The highest model probability is associated with "
+            "The highest model probability "
+            "is associated with "
             f"<b>{top_class}</b> at "
             f"<b>{top_probability * 100:.2f}%</b>. "
         )
 
-        if len(probability_items) > 1:
+        if len(
+            probability_items
+        ) > 1:
 
             second_class, second_probability = (
                 probability_items[1]
@@ -1675,48 +2351,46 @@ def generate_pdf_report(
             )
 
             probability_text += (
-                f"The next highest probability is "
-                f"<b>{second_class}</b> at "
+                "The next highest probability "
+                f"is <b>{second_class}</b> at "
                 f"<b>{second_probability * 100:.2f}%</b>, "
-                f"giving a probability difference of "
-                f"<b>{difference * 100:.2f} percentage points</b>. "
+                "giving a probability difference "
+                f"of <b>{difference * 100:.2f} "
+                "percentage points</b>. "
             )
 
             if difference >= 0.30:
 
                 probability_text += (
-                    "This indicates a comparatively strong separation "
-                    "between the leading class and the next most likely "
-                    "class."
+                    "This indicates a comparatively "
+                    "strong separation between the "
+                    "leading class and the next "
+                    "most likely class."
                 )
 
             elif difference >= 0.10:
 
                 probability_text += (
-                    "This indicates a noticeable but not decisive "
-                    "separation between the leading classes."
+                    "This indicates a noticeable "
+                    "but not decisive separation "
+                    "between the leading classes."
                 )
 
             else:
 
                 probability_text += (
-                    "The relatively small separation indicates that "
-                    "the model has meaningful uncertainty between "
+                    "The relatively small separation "
+                    "indicates that the model has "
+                    "meaningful uncertainty between "
                     "the leading classes."
                 )
-
-        else:
-
-            probability_text += (
-                "No alternative class probabilities were available "
-                "for comparison."
-            )
 
     else:
 
         probability_text = (
-            "A probability distribution was not available for "
-            "detailed class comparison."
+            "A probability distribution was "
+            "not available for detailed "
+            "class comparison."
         )
 
     story.append(
@@ -1726,9 +2400,9 @@ def generate_pdf_report(
         )
     )
 
-    # ========================================================
-    # CLASS PROBABILITY TABLE
-    # ========================================================
+    # --------------------------------------------------------
+    # PROBABILITY TABLE
+    # --------------------------------------------------------
 
     story.append(
         Paragraph(
@@ -1737,81 +2411,101 @@ def generate_pdf_report(
         )
     )
 
-    prob_data = [
+    probability_table_data = [
         [
             "Class",
             "Probability",
         ]
     ]
 
-    for key, value in probability_items:
+    for key, value in (
+        probability_items
+    ):
 
-        prob_data.append([
-            str(key),
-            f"{value * 100:.2f}%",
-        ])
+        probability_table_data.append(
+            [
+                str(key),
+                f"{value * 100:.2f}%",
+            ]
+        )
 
-    if len(prob_data) == 1:
+    if len(
+        probability_table_data
+    ) == 1:
 
-        prob_data.append([
-            "Unavailable",
-            "0.00%",
-        ])
+        probability_table_data.append(
+            [
+                "Unavailable",
+                "0.00%",
+            ]
+        )
 
-    prob_table = Table(
-        prob_data,
-        colWidths=[300, 240],
+    probability_table = Table(
+        probability_table_data,
+        colWidths=[
+            300,
+            240,
+        ],
     )
 
-    prob_table.setStyle(
-        TableStyle([
-            (
-                "BACKGROUND",
-                (0, 0),
-                (-1, 0),
-                colors.HexColor("#0284c7"),
-            ),
+    probability_table.setStyle(
+        TableStyle(
+            [
 
-            (
-                "TEXTCOLOR",
-                (0, 0),
-                (-1, 0),
-                colors.white,
-            ),
+                (
+                    "BACKGROUND",
+                    (0, 0),
+                    (-1, 0),
+                    colors.HexColor(
+                        "#0284c7"
+                    ),
+                ),
 
-            (
-                "GRID",
-                (0, 0),
-                (-1, -1),
-                0.5,
-                colors.HexColor("#e2e8f0"),
-            ),
+                (
+                    "TEXTCOLOR",
+                    (0, 0),
+                    (-1, 0),
+                    colors.white,
+                ),
 
-            (
-                "PADDING",
-                (0, 0),
-                (-1, -1),
-                6,
-            ),
+                (
+                    "GRID",
+                    (0, 0),
+                    (-1, -1),
+                    0.5,
+                    colors.HexColor(
+                        "#e2e8f0"
+                    ),
+                ),
 
-            (
-                "VALIGN",
-                (0, 0),
-                (-1, -1),
-                "MIDDLE",
-            ),
-        ])
+                (
+                    "PADDING",
+                    (0, 0),
+                    (-1, -1),
+                    6,
+                ),
+
+                (
+                    "VALIGN",
+                    (0, 0),
+                    (-1, -1),
+                    "MIDDLE",
+                ),
+            ]
+        )
     )
 
-    story.append(prob_table)
+    story.append(
+        probability_table
+    )
 
     story.append(
         Spacer(1, 15)
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # ORIGINAL MRI
-    # ========================================================
+    # --------------------------------------------------------
 
     image_rel = getattr(
         analysis,
@@ -1821,7 +2515,9 @@ def generate_pdf_report(
 
     if (
         image_rel
-        and image_rel.startswith("/uploads/")
+        and image_rel.startswith(
+            "/uploads/"
+        )
     ):
 
         image_filename = (
@@ -1863,9 +2559,9 @@ def generate_pdf_report(
                 Spacer(1, 15)
             )
 
-    # ========================================================
+    # --------------------------------------------------------
     # GRAD-CAM
-    # ========================================================
+    # --------------------------------------------------------
 
     gradcam_rel = getattr(
         analysis,
@@ -1877,7 +2573,9 @@ def generate_pdf_report(
 
     if (
         gradcam_rel
-        and gradcam_rel.startswith("/uploads/")
+        and gradcam_rel.startswith(
+            "/uploads/"
+        )
     ):
 
         gradcam_filename = (
@@ -1929,14 +2627,18 @@ def generate_pdf_report(
             story.append(
                 Paragraph(
                     (
-                        "The Grad-CAM visualization provides a "
-                        "model-focused representation of the image "
-                        "regions that contributed most strongly to "
-                        f"the <b>{prediction}</b> classification. "
-                        "Highlighted regions should be interpreted "
-                        "as areas receiving greater influence from "
-                        "the neural network rather than as definitive "
-                        "evidence of disease."
+                        "The Grad-CAM visualization "
+                        "provides a model-focused "
+                        "representation of the image "
+                        "regions that contributed most "
+                        "strongly to the "
+                        f"<b>{prediction}</b> "
+                        "classification. Highlighted "
+                        "regions should be interpreted "
+                        "as areas receiving greater "
+                        "influence from the neural "
+                        "network rather than as "
+                        "definitive evidence of disease."
                     ),
                     explanation_style,
                 )
@@ -1946,9 +2648,9 @@ def generate_pdf_report(
                 Spacer(1, 10)
             )
 
-    # ========================================================
+    # --------------------------------------------------------
     # LIME
-    # ========================================================
+    # --------------------------------------------------------
 
     lime_rel = getattr(
         analysis,
@@ -1960,7 +2662,9 @@ def generate_pdf_report(
 
     if (
         lime_rel
-        and lime_rel.startswith("/uploads/")
+        and lime_rel.startswith(
+            "/uploads/"
+        )
     ):
 
         lime_filename = (
@@ -2012,13 +2716,16 @@ def generate_pdf_report(
             story.append(
                 Paragraph(
                     (
-                        "The LIME visualization provides a local "
-                        "explanation of the model decision by "
-                        "identifying image regions that contributed "
-                        "to the prediction for this individual MRI. "
-                        "These regions describe the behavior of the "
-                        "AI model and should not be interpreted as "
-                        "a direct anatomical diagnosis."
+                        "The LIME visualization "
+                        "provides a local explanation "
+                        "of the model decision by "
+                        "identifying image regions "
+                        "that contributed to the "
+                        "prediction for this individual "
+                        "MRI. These regions describe "
+                        "the behavior of the AI model "
+                        "and should not be interpreted "
+                        "as a direct anatomical diagnosis."
                     ),
                     explanation_style,
                 )
@@ -2028,9 +2735,9 @@ def generate_pdf_report(
                 Spacer(1, 10)
             )
 
-    # ========================================================
-    # OVERALL AI FINDINGS
-    # ========================================================
+    # --------------------------------------------------------
+    # OVERALL FINDINGS
+    # --------------------------------------------------------
 
     story.append(
         Paragraph(
@@ -2039,46 +2746,60 @@ def generate_pdf_report(
         )
     )
 
-    if gradcam_available and lime_available:
+    if (
+        gradcam_available
+        and lime_available
+    ):
 
         explanation_status = (
-            "Both Grad-CAM and LIME explainability outputs "
-            "were successfully generated."
+            "Both Grad-CAM and LIME "
+            "explainability outputs were "
+            "successfully generated."
         )
 
     elif gradcam_available:
 
         explanation_status = (
-            "Grad-CAM was successfully generated, while a "
-            "usable LIME visualization was not available."
+            "Grad-CAM was successfully "
+            "generated, while a usable "
+            "LIME visualization was not "
+            "available."
         )
 
     elif lime_available:
 
         explanation_status = (
-            "LIME was successfully generated, while a "
-            "usable Grad-CAM visualization was not available."
+            "LIME was successfully "
+            "generated, while a usable "
+            "Grad-CAM visualization was "
+            "not available."
         )
 
     else:
 
         explanation_status = (
-            "Neither Grad-CAM nor LIME produced a usable "
+            "Neither Grad-CAM nor LIME "
+            "produced a usable "
             "visualization for this analysis."
         )
 
     overall_text = (
-        f"The overall MEDXAI analysis classified the MRI as "
-        f"<b>{prediction}</b> with a confidence of "
-        f"<b>{confidence:.2f}%</b>. "
+        "The overall MEDXAI analysis "
+        f"classified the MRI as "
+        f"<b>{prediction}</b> with a "
+        f"confidence of <b>{confidence:.2f}%</b>. "
         f"{explanation_status} "
-        "The probability distribution describes how the model "
-        "allocated prediction likelihood across the available "
-        "classes, while Grad-CAM and LIME provide complementary "
-        "views of the model's decision process. "
-        "These explainability methods describe model behavior "
-        "and do not independently establish the presence, "
-        "absence, severity, or stage of Alzheimer's disease."
+        "The probability distribution "
+        "describes how the model allocated "
+        "prediction likelihood across the "
+        "available classes, while Grad-CAM "
+        "and LIME provide complementary "
+        "views of the model's decision "
+        "process. These explainability "
+        "methods describe model behavior "
+        "and do not independently establish "
+        "the presence, absence, severity, "
+        "or stage of Alzheimer's disease."
     )
 
     story.append(
@@ -2088,17 +2809,19 @@ def generate_pdf_report(
         )
     )
 
-    # ========================================================
-    # AI FINDINGS
-    # ========================================================
+    # --------------------------------------------------------
+    # FINDINGS
+    # --------------------------------------------------------
 
     if probability_items:
 
-        top_class, top_probability = probability_items[0]
+        top_class, top_probability = (
+            probability_items[0]
+        )
 
         story.append(
             Paragraph(
-                f"• Leading classification: "
+                "• Leading classification: "
                 f"<b>{top_class}</b>",
                 finding_style,
             )
@@ -2106,7 +2829,7 @@ def generate_pdf_report(
 
         story.append(
             Paragraph(
-                f"• Leading probability: "
+                "• Leading probability: "
                 f"<b>{top_probability * 100:.2f}%</b>",
                 finding_style,
             )
@@ -2114,7 +2837,7 @@ def generate_pdf_report(
 
         story.append(
             Paragraph(
-                f"• Reported model confidence: "
+                "• Reported model confidence: "
                 f"<b>{confidence:.2f}%</b>",
                 finding_style,
             )
@@ -2124,17 +2847,19 @@ def generate_pdf_report(
         Paragraph(
             (
                 "• Explainability interpretation: "
-                "highlighted regions represent areas that "
-                "influenced the AI model's decision and should "
-                "not be treated as independently diagnostic."
+                "highlighted regions represent "
+                "areas that influenced the AI "
+                "model's decision and should not "
+                "be treated as independently "
+                "diagnostic."
             ),
             finding_style,
         )
     )
 
-    # ========================================================
-    # MEDICAL DISCLAIMER
-    # ========================================================
+    # --------------------------------------------------------
+    # DISCLAIMER
+    # --------------------------------------------------------
 
     story.append(
         Spacer(1, 10)
@@ -2144,32 +2869,39 @@ def generate_pdf_report(
         Paragraph(
             (
                 "<b>MEDICAL DISCLAIMER:</b> "
-                "This AI-generated report is produced by the "
-                "MEDXAI EfficientNetB0 Engine for research and "
-                "clinical decision-support purposes. The "
-                "prediction, probability values, Grad-CAM "
-                "visualization, and LIME explanation describe "
-                "the behavior of an artificial intelligence model "
-                "and are not a medical diagnosis. This report "
-                "must be reviewed by a qualified radiologist, "
-                "neurologist, or other appropriately qualified "
-                "healthcare professional before any clinical "
-                "diagnosis or treatment decision is made."
+                "This AI-generated report is "
+                "produced by the MEDXAI "
+                "EfficientNetB0 Engine for "
+                "research and clinical "
+                "decision-support purposes. "
+                "The prediction, probability "
+                "values, Grad-CAM visualization, "
+                "and LIME explanation describe "
+                "the behavior of an artificial "
+                "intelligence model and are not "
+                "a medical diagnosis. This report "
+                "must be reviewed by a qualified "
+                "radiologist, neurologist, or "
+                "other appropriately qualified "
+                "healthcare professional before "
+                "any clinical diagnosis or "
+                "treatment decision is made."
             ),
             disclaimer_style,
         )
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # BUILD PDF
-    # ========================================================
+    # --------------------------------------------------------
 
-    doc.build(story)
+    doc.build(
+        story
+    )
 
 
 # ============================================================
 # CREATE REPORT
-# CURRENT USER ONLY
 # ============================================================
 
 @app.post("/reports/{id}")
@@ -2198,10 +2930,21 @@ def create_report(
             detail="Analysis not found",
         )
 
-    report_id = str(uuid.uuid4())
+    report_id = str(
+        uuid.uuid4()
+    )
+
+    original_name = (
+        os.path.basename(
+            analysis.filename
+            or "MRI"
+        )
+    )
 
     pdf_filename = (
-        f"Report_{analysis.filename.replace('.', '_')}.pdf"
+        f"Report_"
+        f"{os.path.splitext(original_name)[0]}"
+        f".pdf"
     )
 
     pdf_path = os.path.join(
@@ -2217,67 +2960,115 @@ def create_report(
             pdf_path,
         )
 
-    except Exception as e:
+    except Exception as error:
 
         print(
-            f"ReportLab PDF generation error: {e}"
+            "ReportLab PDF generation error:",
+            error,
         )
 
         raise HTTPException(
             status_code=500,
-            detail=f"PDF generation failed: {str(e)}",
+            detail=(
+                "PDF generation failed: "
+                f"{str(error)}"
+            ),
+        )
+
+    if not os.path.exists(
+        pdf_path
+    ):
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "PDF file was not created"
+            ),
         )
 
     content = (
-        f"PDF Report generated at {pdf_path}"
-    )
-
-    report_obj = models.Report(
-        id=report_id,
-
-        analysis_id=id,
-
-        user_id=current_user.id,
-
-        filename=pdf_filename,
-
-        content=content,
+        "PDF Report generated successfully"
     )
 
     try:
 
-        db.add(report_obj)
-        db.commit()
-        db.refresh(report_obj)
+        report_obj = models.Report(
+            id=report_id,
 
-    except Exception as e:
+            analysis_id=id,
+
+            user_id=current_user.id,
+
+            filename=pdf_filename,
+
+            content=content,
+        )
+
+        db.add(
+            report_obj
+        )
+
+        db.commit()
+
+        db.refresh(
+            report_obj
+        )
+
+    except Exception as error:
 
         db.rollback()
 
+        if os.path.exists(
+            pdf_path
+        ):
+
+            try:
+                os.remove(
+                    pdf_path
+                )
+            except Exception:
+                pass
+
         raise HTTPException(
             status_code=500,
-            detail=f"Report database save failed: {str(e)}",
+            detail=(
+                "Report database save failed: "
+                f"{str(error)}"
+            ),
         )
 
     return {
+
         "id": report_obj.id,
-        "analysis_id": report_obj.analysis_id,
-        "filename": report_obj.filename,
-        "content": report_obj.content,
+
+        "analysis_id": (
+            report_obj.analysis_id
+        ),
+
+        "filename": (
+            report_obj.filename
+        ),
+
+        "content": (
+            report_obj.content
+        ),
 
         "download_url": (
-            f"/reports/{report_obj.id}/download"
+            f"/reports/"
+            f"{report_obj.id}"
+            f"/download"
         ),
 
         "created_at": (
             report_obj.created_at.isoformat()
+            if report_obj.created_at
+            else None
         ),
     }
 
 
 # ============================================================
 # DOWNLOAD REPORT
-# CURRENT USER ONLY
 # ============================================================
 
 @app.get("/reports/{id}/download")
@@ -2311,18 +3102,85 @@ def download_report(
         f"{report.id}.pdf",
     )
 
-    if os.path.exists(pdf_path):
+    if not os.path.exists(
+        pdf_path
+    ):
 
-        return FileResponse(
-            pdf_path,
-            filename=report.filename,
-            media_type="application/pdf",
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Report file not found"
+            ),
         )
 
-    raise HTTPException(
-        status_code=404,
-        detail="Report file not found",
+    return FileResponse(
+        pdf_path,
+        filename=report.filename,
+        media_type="application/pdf",
     )
+
+
+# ============================================================
+# DELETE REPORT
+# ============================================================
+
+@app.delete("/reports/{id}")
+def delete_report(
+    id: str,
+    current_user: models.User = Depends(
+        auth.get_current_user
+    ),
+    db: Session = Depends(get_db),
+):
+
+    report = (
+        db.query(models.Report)
+        .filter(
+            models.Report.id == id,
+            models.Report.user_id
+            == current_user.id,
+        )
+        .first()
+    )
+
+    if not report:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Report not found",
+        )
+
+    pdf_path = os.path.join(
+        REPORTS_DIR,
+        f"{report.id}.pdf",
+    )
+
+    if os.path.exists(
+        pdf_path
+    ):
+
+        try:
+            os.remove(
+                pdf_path
+            )
+        except Exception as error:
+
+            print(
+                "Could not delete PDF:",
+                error,
+            )
+
+    db.delete(
+        report
+    )
+
+    db.commit()
+
+    return {
+        "message": (
+            "Report deleted successfully"
+        ),
+    }
 
 
 # ============================================================

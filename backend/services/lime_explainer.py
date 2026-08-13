@@ -1,95 +1,332 @@
 
 import os
+
 import cv2
 import numpy as np
 from PIL import Image
+
 from lime import lime_image
 from skimage.segmentation import mark_boundaries
 
 
+# ============================================================
+# LIME EXPLANATION GENERATOR
+# ============================================================
+
 def generate_lime_explanation(
     model,
     image_path: str,
-    output_path: str
+    output_path: str,
 ):
     """
-    Generate a LIME superpixel explanation image.
+    Generate a visual LIME superpixel explanation.
+
+    The output preserves the original MRI while highlighting
+    image regions that contribute positively or negatively to
+    the model's predicted class.
+
+    Parameters
+    ----------
+    model:
+        Loaded TensorFlow/Keras classification model.
+
+    image_path:
+        Path to the original MRI image.
+
+    output_path:
+        Destination path for the generated LIME visualization.
+
+    Returns
+    -------
+    str
+        Path to the generated LIME image.
     """
 
-    os.makedirs(
-        os.path.dirname(output_path) or ".",
-        exist_ok=True
+    # --------------------------------------------------------
+    # CREATE OUTPUT DIRECTORY
+    # --------------------------------------------------------
+
+    output_dir = os.path.dirname(output_path)
+
+    if output_dir:
+        os.makedirs(
+            output_dir,
+            exist_ok=True,
+        )
+
+    # --------------------------------------------------------
+    # LOAD MRI
+    # --------------------------------------------------------
+
+    try:
+        image = (
+            Image.open(image_path)
+            .convert("RGB")
+            .resize(
+                (224, 224),
+                Image.Resampling.LANCZOS,
+            )
+        )
+    except Exception as error:
+        raise RuntimeError(
+            f"Could not load MRI image: {error}"
+        )
+
+    image_array = np.asarray(
+        image,
+        dtype=np.float32,
     )
 
-    img = Image.open(
-        image_path
-    ).convert("RGB").resize((224, 224))
-
-    img_array = np.array(
-        img,
-        dtype=np.float32
-    )
-
-    explainer = lime_image.LimeImageExplainer(
-        verbose=False
-    )
+    # --------------------------------------------------------
+    # MODEL PREDICTION FUNCTION
+    # --------------------------------------------------------
 
     def predict_fn(images):
+        """
+        LIME calls this function with batches of perturbed images.
+        """
+
         images = np.asarray(
             images,
-            dtype=np.float32
+            dtype=np.float32,
         )
 
-        return model.predict(
+        predictions = model.predict(
             images,
-            verbose=0
+            verbose=0,
         )
 
-    explanation = explainer.explain_instance(
-        img_array,
-        predict_fn,
-        top_labels=1,
-        hide_color=0,
-        num_samples=50,
-        batch_size=10
+        predictions = np.asarray(
+            predictions,
+            dtype=np.float32,
+        )
+
+        # Safety normalization.
+        # Normally the EfficientNet model already returns
+        # probabilities because its final layer is softmax.
+        if predictions.ndim != 2:
+            raise RuntimeError(
+                "Model prediction output must be a 2D "
+                "array of shape (batch, classes)."
+            )
+
+        return predictions
+
+    # --------------------------------------------------------
+    # CREATE LIME EXPLAINER
+    # --------------------------------------------------------
+
+    explainer = lime_image.LimeImageExplainer(
+        verbose=False,
     )
 
-    predicted_label = explanation.top_labels[0]
+    # --------------------------------------------------------
+    # GENERATE EXPLANATION
+    # --------------------------------------------------------
 
-    temp, mask = explanation.get_image_and_mask(
-        predicted_label,
-        positive_only=False,
-        num_features=8,
-        hide_rest=False
+    try:
+        explanation = explainer.explain_instance(
+            image_array,
+            predict_fn,
+            top_labels=1,
+            hide_color=0,
+            num_samples=100,
+            batch_size=10,
+        )
+    except Exception as error:
+        raise RuntimeError(
+            f"LIME explanation failed: {error}"
+        )
+
+    # --------------------------------------------------------
+    # GET PREDICTED CLASS
+    # --------------------------------------------------------
+
+    predicted_label = (
+        explanation.top_labels[0]
     )
 
-    temp = np.clip(
-        temp,
+    # --------------------------------------------------------
+    # GET POSITIVE LIME FEATURES
+    # --------------------------------------------------------
+
+    try:
+        positive_image, positive_mask = (
+            explanation.get_image_and_mask(
+                predicted_label,
+                positive_only=True,
+                num_features=10,
+                hide_rest=False,
+            )
+        )
+    except Exception as error:
+        raise RuntimeError(
+            f"Could not extract LIME features: {error}"
+        )
+
+    # --------------------------------------------------------
+    # GET ALL IMPORTANT FEATURES
+    # --------------------------------------------------------
+
+    try:
+        all_features_image, all_features_mask = (
+            explanation.get_image_and_mask(
+                predicted_label,
+                positive_only=False,
+                num_features=10,
+                hide_rest=False,
+            )
+        )
+    except Exception as error:
+        raise RuntimeError(
+            f"Could not extract LIME feature mask: {error}"
+        )
+
+    # --------------------------------------------------------
+    # PREPARE ORIGINAL IMAGE
+    # --------------------------------------------------------
+
+    original = np.asarray(
+        image,
+        dtype=np.float32,
+    )
+
+    original = np.clip(
+        original,
         0,
-        255
+        255,
     ).astype(np.uint8)
 
-    marked_image = mark_boundaries(
-        temp / 255.0,
-        mask,
+    # --------------------------------------------------------
+    # BUILD LIME VISUALIZATION
+    # --------------------------------------------------------
+
+    # Use the original MRI as the base instead of allowing
+    # LIME to replace large areas with its hidden color.
+    base = (
+        original.astype(np.float32)
+        / 255.0
+    )
+
+    # Positive contribution regions.
+    positive_mask_binary = (
+        positive_mask > 0
+    ).astype(np.uint8)
+
+    # All selected regions.
+    all_mask_binary = (
+        all_features_mask != 0
+    ).astype(np.uint8)
+
+    # --------------------------------------------------------
+    # CREATE COLORED CONTRIBUTION OVERLAY
+    # --------------------------------------------------------
+
+    overlay = np.zeros_like(
+        original,
+        dtype=np.uint8,
+    )
+
+    # Positive LIME regions are highlighted.
+    #
+    # OpenCV uses BGR internally.
+    # Red in BGR = (0, 0, 255)
+    overlay[
+        positive_mask_binary > 0
+    ] = (0, 0, 255)
+
+    # Negative/other selected regions are shown in blue.
+    negative_mask_binary = (
+        (all_features_mask < 0)
+        & (positive_mask_binary == 0)
+    ).astype(np.uint8)
+
+    overlay[
+        negative_mask_binary > 0
+    ] = (255, 0, 0)
+
+    # --------------------------------------------------------
+    # BLEND MRI + LIME
+    # --------------------------------------------------------
+
+    original_bgr = cv2.cvtColor(
+        original,
+        cv2.COLOR_RGB2BGR,
+    )
+
+    blended = cv2.addWeighted(
+        original_bgr,
+        0.68,
+        overlay,
+        0.32,
+        0,
+    )
+
+    # --------------------------------------------------------
+    # DRAW SUPERPIXEL BOUNDARIES
+    # --------------------------------------------------------
+
+    boundary_image = mark_boundaries(
+        blended.astype(np.float32) / 255.0,
+        all_mask_binary,
         color=(1, 1, 0),
-        mode="outer"
+        mode="outer",
     )
 
-    marked_image = np.clip(
-        marked_image * 255,
+    boundary_image = np.clip(
+        boundary_image * 255.0,
         0,
-        255
+        255,
     ).astype(np.uint8)
 
-    marked_image = cv2.cvtColor(
-        marked_image,
-        cv2.COLOR_RGB2BGR
+    # Convert RGB → BGR for OpenCV.
+    final_image = cv2.cvtColor(
+        boundary_image,
+        cv2.COLOR_RGB2BGR,
     )
+
+    # --------------------------------------------------------
+    # ADD TITLE BAR
+    # --------------------------------------------------------
+
+    title_height = 38
+
+    canvas = np.zeros(
+        (
+            final_image.shape[0] + title_height,
+            final_image.shape[1],
+            3,
+        ),
+        dtype=np.uint8,
+    )
+
+    # Keep the title area dark.
+    canvas[
+        title_height:
+    ] = final_image
+
+    cv2.putText(
+        canvas,
+        "LIME - Model Feature Contribution",
+        (8, 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+
+    # --------------------------------------------------------
+    # SAVE IMAGE
+    # --------------------------------------------------------
 
     success = cv2.imwrite(
         output_path,
-        marked_image
+        canvas,
+        [
+            cv2.IMWRITE_JPEG_QUALITY,
+            95,
+        ],
     )
 
     if not success:
@@ -97,5 +334,24 @@ def generate_lime_explanation(
             f"Could not save LIME image: {output_path}"
         )
 
-    return output_path
+    # --------------------------------------------------------
+    # VALIDATE OUTPUT
+    # --------------------------------------------------------
 
+    if not os.path.exists(
+        output_path
+    ):
+        raise RuntimeError(
+            "LIME output file was not created."
+        )
+
+    file_size = os.path.getsize(
+        output_path
+    )
+
+    if file_size <= 1000:
+        raise RuntimeError(
+            "Generated LIME image is unexpectedly small."
+        )
+
+    return output_path

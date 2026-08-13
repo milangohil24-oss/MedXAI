@@ -1,6 +1,14 @@
-import { ChangeEvent, useState } from "react";
 
-const API_URL = import.meta.env.VITE_API_BASE_URL || "https://medxai-backend.onrender.com";
+import {
+  ChangeEvent,
+  useEffect,
+  useState,
+} from "react";
+
+const API_URL = (
+  import.meta.env.VITE_API_BASE_URL ||
+  "https://medxai-backend.onrender.com"
+).replace(/\/+$/, "");
 
 interface PredictionResult {
   analysis_id: string;
@@ -12,6 +20,11 @@ interface PredictionResult {
   gradcam_url?: string | null;
   lime_url?: string | null;
   image_url?: string | null;
+  explanation_status?: {
+    gradcam?: string;
+    lime?: string;
+  };
+  lime_error?: string | null;
 }
 
 interface ReportResult {
@@ -23,77 +36,169 @@ interface ReportResult {
   created_at: string;
 }
 
+interface AnalysisHistory {
+  id: string;
+  analysis_id?: string;
+  filename: string;
+  prediction: string;
+  confidence: number;
+  confidence_percentage: number;
+  probabilities: Record<string, number>;
+  gradcam_url?: string | null;
+  lime_url?: string | null;
+  image_url?: string | null;
+  created_at: string;
+}
+
 export default function Analyze() {
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
-  const [result, setResult] = useState<PredictionResult | null>(null);
+
+  const [result, setResult] =
+    useState<PredictionResult | null>(null);
 
   const [loading, setLoading] = useState(false);
-  const [reportLoading, setReportLoading] = useState(false);
+  const [limeLoading, setLimeLoading] = useState(false);
+  const [reportLoading, setReportLoading] =
+    useState(false);
 
-  const [report, setReport] = useState<ReportResult | null>(null);
+  const [report, setReport] =
+    useState<ReportResult | null>(null);
 
   const [error, setError] = useState("");
+  const [limeError, setLimeError] = useState("");
   const [reportError, setReportError] = useState("");
 
-  function handleFileChange(e: ChangeEvent<HTMLInputElement>) {
-    const selectedFile = e.target.files?.[0];
+  const [restoring, setRestoring] = useState(true);
 
-    if (!selectedFile) return;
-
-    setFile(selectedFile);
-    setResult(null);
-    setReport(null);
-    setError("");
-    setReportError("");
-
-    if (preview) {
-      URL.revokeObjectURL(preview);
-    }
-
-    setPreview(URL.createObjectURL(selectedFile));
-  }
+  // ============================================================
+  // TOKEN
+  // ============================================================
 
   function getToken(): string {
-    return localStorage.getItem("medxai_token") || "";
+    return (
+      localStorage.getItem("medxai_token") || ""
+    );
   }
 
-  async function handleAnalyze() {
-    if (!file) {
-      setError("Please select an MRI image first.");
-      return;
+  // ============================================================
+  // IMAGE URL
+  // ============================================================
+
+  function getImageUrl(
+    url?: string | null
+  ): string {
+    if (!url) return "";
+
+    const cleanUrl = url.trim();
+
+    if (!cleanUrl) return "";
+
+    if (
+      cleanUrl.startsWith("http://") ||
+      cleanUrl.startsWith("https://")
+    ) {
+      return cleanUrl;
     }
 
+    if (cleanUrl.startsWith("/")) {
+      return `${API_URL}${cleanUrl}`;
+    }
+
+    return `${API_URL}/${cleanUrl}`;
+  }
+
+  // ============================================================
+  // HANDLE AUTH FAILURE
+  // ============================================================
+
+  function handleUnauthorized() {
+    localStorage.removeItem(
+      "medxai_token"
+    );
+
+    localStorage.removeItem(
+      "medxai_user"
+    );
+  }
+
+  // ============================================================
+  // LOAD EXISTING DASHBOARD / LATEST ANALYSIS
+  // ============================================================
+
+  useEffect(() => {
+    restoreLatestAnalysis();
+
+    return () => {
+      if (preview) {
+        URL.revokeObjectURL(preview);
+      }
+    };
+  }, []);
+
+  async function restoreLatestAnalysis() {
     const token = getToken();
 
     if (!token) {
-      setError("Please log in before analyzing an MRI.");
+      setRestoring(false);
       return;
     }
 
-    setLoading(true);
-    setError("");
-    setReportError("");
-    setResult(null);
-    setReport(null);
-
     try {
-      const formData = new FormData();
-      formData.append("file", file);
+      /*
+       * First try localStorage.
+       * This makes the result survive a browser refresh
+       * immediately.
+       */
 
-      const response = await fetch(`${API_URL}/predict`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-        body: formData,
-      });
+      const cached =
+        localStorage.getItem(
+          "medxai_latest_analysis"
+        );
 
-      const data = await response.json().catch(() => ({}));
+      if (cached) {
+        try {
+          const parsed =
+            JSON.parse(cached);
+
+          if (
+            parsed &&
+            parsed.analysis_id
+          ) {
+            setResult(parsed);
+          }
+        } catch {
+          localStorage.removeItem(
+            "medxai_latest_analysis"
+          );
+        }
+      }
+
+      /*
+       * Then fetch the real latest analysis
+       * from the backend.
+       */
+
+      const response = await fetch(
+        `${API_URL}/analyses`,
+        {
+          method: "GET",
+          headers: {
+            Authorization:
+              `Bearer ${token}`,
+          },
+        }
+      );
+
+      const data =
+        await response.json().catch(
+          () => []
+        );
 
       if (response.status === 401) {
-        localStorage.removeItem("medxai_token");
-        localStorage.removeItem("medxai_user");
+        handleUnauthorized();
+
+        setResult(null);
 
         throw new Error(
           "Your login session has expired. Please log in again."
@@ -102,15 +207,464 @@ export default function Analyze() {
 
       if (!response.ok) {
         throw new Error(
-          data?.detail || "MRI analysis failed."
+          data?.detail ||
+            "Unable to load previous analyses."
         );
       }
 
-      console.log("MEDXAI prediction response:", data);
+      if (
+        Array.isArray(data) &&
+        data.length > 0
+      ) {
+        const latest: AnalysisHistory =
+          data[0];
 
-      setResult(data);
+        const restoredResult: PredictionResult =
+          {
+            analysis_id:
+              latest.id ||
+              latest.analysis_id ||
+              "",
+
+            filename:
+              latest.filename ||
+              "MRI Scan",
+
+            prediction:
+              latest.prediction,
+
+            confidence:
+              Number(
+                latest.confidence || 0
+              ),
+
+            confidence_percentage:
+              Number(
+                latest.confidence_percentage ||
+                  0
+              ),
+
+            probabilities:
+              latest.probabilities ||
+              {},
+
+            gradcam_url:
+              latest.gradcam_url ||
+              null,
+
+            lime_url:
+              latest.lime_url ||
+              null,
+
+            image_url:
+              latest.image_url ||
+              null,
+          };
+
+        setResult(
+          restoredResult
+        );
+
+        localStorage.setItem(
+          "medxai_latest_analysis",
+          JSON.stringify(
+            restoredResult
+          )
+        );
+
+        /*
+         * Restore the uploaded MRI preview
+         * from backend if possible.
+         */
+        if (
+          restoredResult.image_url
+        ) {
+          setPreview(
+            getImageUrl(
+              restoredResult.image_url
+            )
+          );
+        }
+
+        /*
+         * Restore report belonging to
+         * this analysis.
+         */
+        await restoreReport(
+          restoredResult.analysis_id,
+          token
+        );
+      }
     } catch (err: any) {
-      console.error("MEDXAI analysis error:", err);
+      console.error(
+        "MEDXAI restore error:",
+        err
+      );
+
+      /*
+       * Do not destroy cached dashboard
+       * just because the backend is temporarily
+       * unavailable.
+       */
+    } finally {
+      setRestoring(false);
+    }
+  }
+
+  // ============================================================
+  // RESTORE REPORT
+  // ============================================================
+
+  async function restoreReport(
+    analysisId: string,
+    token: string
+  ) {
+    try {
+      const response = await fetch(
+        `${API_URL}/reports`,
+        {
+          method: "GET",
+          headers: {
+            Authorization:
+              `Bearer ${token}`,
+          },
+        }
+      );
+
+      const data =
+        await response
+          .json()
+          .catch(() => []);
+
+      if (
+        response.status === 401
+      ) {
+        return;
+      }
+
+      if (!response.ok) {
+        return;
+      }
+
+      if (
+        Array.isArray(data)
+      ) {
+        const existingReport =
+          data.find(
+            (item: ReportResult) =>
+              item.analysis_id ===
+              analysisId
+          );
+
+        if (existingReport) {
+          setReport(
+            existingReport
+          );
+        }
+      }
+    } catch (err) {
+      console.error(
+        "MEDXAI report restore error:",
+        err
+      );
+    }
+  }
+
+  // ============================================================
+  // FILE CHANGE
+  // ============================================================
+
+  function handleFileChange(
+    e: ChangeEvent<HTMLInputElement>
+  ) {
+    const selectedFile =
+      e.target.files?.[0];
+
+    if (!selectedFile) {
+      return;
+    }
+
+    setFile(selectedFile);
+
+    setResult(null);
+    setReport(null);
+
+    setError("");
+    setLimeError("");
+    setReportError("");
+
+    if (preview) {
+      URL.revokeObjectURL(preview);
+    }
+
+    setPreview(
+      URL.createObjectURL(
+        selectedFile
+      )
+    );
+
+    /*
+     * New upload means new analysis.
+     */
+    localStorage.removeItem(
+      "medxai_latest_analysis"
+    );
+  }
+
+  // ============================================================
+  // GENERATE LIME
+  // ============================================================
+
+  async function generateLime(
+    analysisId: string,
+    currentResult: PredictionResult
+  ) {
+    const token = getToken();
+
+    if (!token) {
+      return;
+    }
+
+    setLimeLoading(true);
+    setLimeError("");
+
+    try {
+      console.log(
+        "Generating LIME for:",
+        analysisId
+      );
+
+      const response = await fetch(
+        `${API_URL}/explain/lime`,
+        {
+          method: "POST",
+
+          headers: {
+            Authorization:
+              `Bearer ${token}`,
+
+            "Content-Type":
+              "application/json",
+          },
+
+          body: JSON.stringify({
+            analysis_id:
+              analysisId,
+          }),
+        }
+      );
+
+      const data =
+        await response
+          .json()
+          .catch(() => ({}));
+
+      console.log(
+        "MEDXAI LIME response:",
+        data
+      );
+
+      if (
+        response.status === 401
+      ) {
+        handleUnauthorized();
+
+        throw new Error(
+          "Your login session has expired. Please log in again."
+        );
+      }
+
+      if (!response.ok) {
+        throw new Error(
+          data?.detail ||
+            "LIME generation failed."
+        );
+      }
+
+      /*
+       * Backend returns:
+       *
+       * {
+       *   analysis_id,
+       *   url,
+       *   features
+       * }
+       */
+
+      const limeUrl =
+        data?.url ||
+        data?.lime_url ||
+        null;
+
+      const updatedResult: PredictionResult =
+        {
+          ...currentResult,
+          lime_url:
+            limeUrl,
+        };
+
+      setResult(
+        updatedResult
+      );
+
+      localStorage.setItem(
+        "medxai_latest_analysis",
+        JSON.stringify(
+          updatedResult
+        )
+      );
+    } catch (err: any) {
+      console.error(
+        "MEDXAI LIME error:",
+        err
+      );
+
+      setLimeError(
+        err?.message ||
+          "Unable to generate LIME explanation."
+      );
+    } finally {
+      setLimeLoading(false);
+    }
+  }
+
+  // ============================================================
+  // ANALYZE MRI
+  // ============================================================
+
+  async function handleAnalyze() {
+    if (!file) {
+      setError(
+        "Please select an MRI image first."
+      );
+      return;
+    }
+
+    const token = getToken();
+
+    if (!token) {
+      setError(
+        "Please log in before analyzing an MRI."
+      );
+      return;
+    }
+
+    setLoading(true);
+
+    setError("");
+    setLimeError("");
+    setReportError("");
+
+    setResult(null);
+    setReport(null);
+
+    localStorage.removeItem(
+      "medxai_latest_analysis"
+    );
+
+    try {
+      const formData =
+        new FormData();
+
+      formData.append(
+        "file",
+        file
+      );
+
+      const response =
+        await fetch(
+          `${API_URL}/predict`,
+          {
+            method: "POST",
+
+            headers: {
+              Authorization:
+                `Bearer ${token}`,
+            },
+
+            body: formData,
+          }
+        );
+
+      const data =
+        await response
+          .json()
+          .catch(() => ({}));
+
+      if (
+        response.status === 401
+      ) {
+        handleUnauthorized();
+
+        throw new Error(
+          "Your login session has expired. Please log in again."
+        );
+      }
+
+      if (!response.ok) {
+        throw new Error(
+          data?.detail ||
+            "MRI analysis failed."
+        );
+      }
+
+      console.log(
+        "MEDXAI prediction response:",
+        data
+      );
+
+      const predictionResult:
+        PredictionResult =
+        {
+          ...data,
+
+          gradcam_url:
+            data.gradcam_url ||
+            null,
+
+          lime_url:
+            data.lime_url ||
+            null,
+
+          image_url:
+            data.image_url ||
+            null,
+        };
+
+      setResult(
+        predictionResult
+      );
+
+      /*
+       * Save latest result so browser refresh
+       * does not immediately make the page empty.
+       */
+      localStorage.setItem(
+        "medxai_latest_analysis",
+        JSON.stringify(
+          predictionResult
+        )
+      );
+
+      /*
+       * LIME is intentionally deferred by
+       * the backend /predict endpoint.
+       *
+       * Therefore call /explain/lime here.
+       */
+      if (
+        predictionResult.analysis_id
+      ) {
+        generateLime(
+          predictionResult.analysis_id,
+          predictionResult
+        );
+      }
+    } catch (err: any) {
+      console.error(
+        "MEDXAI analysis error:",
+        err
+      );
 
       setError(
         err?.message ||
@@ -120,6 +674,10 @@ export default function Analyze() {
       setLoading(false);
     }
   }
+
+  // ============================================================
+  // GENERATE PDF REPORT
+  // ============================================================
 
   async function handleGenerateReport() {
     if (!result?.analysis_id) {
@@ -147,23 +705,33 @@ export default function Analyze() {
         result.analysis_id
       );
 
-      const response = await fetch(
-        `${API_URL}/reports/${result.analysis_id}`,
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        }
+      const response =
+        await fetch(
+          `${API_URL}/reports/${result.analysis_id}`,
+          {
+            method: "POST",
+
+            headers: {
+              Authorization:
+                `Bearer ${token}`,
+            },
+          }
+        );
+
+      const data =
+        await response
+          .json()
+          .catch(() => ({}));
+
+      console.log(
+        "MEDXAI report response:",
+        data
       );
 
-      const data = await response.json().catch(() => ({}));
-
-      console.log("MEDXAI report response:", data);
-
-      if (response.status === 401) {
-        localStorage.removeItem("medxai_token");
-        localStorage.removeItem("medxai_user");
+      if (
+        response.status === 401
+      ) {
+        handleUnauthorized();
 
         throw new Error(
           "Your login session has expired. Please log in again."
@@ -194,8 +762,14 @@ export default function Analyze() {
     }
   }
 
-  function handleDownloadReport() {
-    if (!report?.id) return;
+  // ============================================================
+  // DOWNLOAD REPORT
+  // ============================================================
+
+  async function handleDownloadReport() {
+    if (!report?.id) {
+      return;
+    }
 
     const token = getToken();
 
@@ -206,78 +780,101 @@ export default function Analyze() {
       return;
     }
 
-    const downloadUrl =
-      `${API_URL}/reports/${report.id}/download`;
+    try {
+      const downloadUrl =
+        `${API_URL}/reports/${report.id}/download`;
 
-    fetch(downloadUrl, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    })
-      .then(async (response) => {
-        if (!response.ok) {
-          const data = await response.json().catch(() => ({}));
+      const response =
+        await fetch(
+          downloadUrl,
+          {
+            method: "GET",
 
-          throw new Error(
-            data?.detail ||
-              "Unable to download the report."
-          );
-        }
-
-        return response.blob();
-      })
-      .then((blob) => {
-        const url = window.URL.createObjectURL(blob);
-
-        const a = document.createElement("a");
-        a.href = url;
-        a.download =
-          report.filename || "MEDXAI_Report.pdf";
-
-        document.body.appendChild(a);
-        a.click();
-
-        a.remove();
-        window.URL.revokeObjectURL(url);
-      })
-      .catch((err) => {
-        console.error(
-          "Report download error:",
-          err
+            headers: {
+              Authorization:
+                `Bearer ${token}`,
+            },
+          }
         );
 
-        setReportError(
-          err?.message ||
+      if (
+        response.status === 401
+      ) {
+        handleUnauthorized();
+
+        throw new Error(
+          "Your login session has expired. Please log in again."
+        );
+      }
+
+      if (!response.ok) {
+        const data =
+          await response
+            .json()
+            .catch(() => ({}));
+
+        throw new Error(
+          data?.detail ||
             "Unable to download the report."
         );
-      });
+      }
+
+      const blob =
+        await response.blob();
+
+      const url =
+        window.URL.createObjectURL(
+          blob
+        );
+
+      const a =
+        document.createElement(
+          "a"
+        );
+
+      a.href = url;
+
+      a.download =
+        report.filename ||
+        "MEDXAI_Report.pdf";
+
+      document.body.appendChild(
+        a
+      );
+
+      a.click();
+
+      a.remove();
+
+      window.URL.revokeObjectURL(
+        url
+      );
+    } catch (err: any) {
+      console.error(
+        "Report download error:",
+        err
+      );
+
+      setReportError(
+        err?.message ||
+          "Unable to download the report."
+      );
+    }
   }
 
-  function getImageUrl(url?: string | null): string {
-    if (!url) return "";
-
-    const cleanUrl = url.trim();
-
-    if (!cleanUrl) return "";
-
-    if (
-      cleanUrl.startsWith("http://") ||
-      cleanUrl.startsWith("https://")
-    ) {
-      return cleanUrl;
-    }
-
-    if (cleanUrl.startsWith("/")) {
-      return `${API_URL}${cleanUrl}`;
-    }
-
-    return `${API_URL}/${cleanUrl}`;
-  }
+  // ============================================================
+  // PAGE
+  // ============================================================
 
   return (
     <div className="page-container">
 
+      {/* ======================================================
+          TOP BAR
+      ====================================================== */}
+
       <div className="topbar">
+
         <div>
           <span className="eyebrow">
             AI ANALYSIS
@@ -297,16 +894,46 @@ export default function Analyze() {
           <span className="pulse" />
           MODEL ONLINE
         </div>
+
       </div>
+
+      {/* ======================================================
+          RESTORING EXISTING ANALYSIS
+      ====================================================== */}
+
+      {restoring && (
+        <div
+          className="glass-panel"
+          style={{
+            marginBottom: "20px",
+            padding: "18px",
+            textAlign: "center",
+          }}
+        >
+          <p
+            style={{
+              margin: 0,
+              color: "#94a3b8",
+            }}
+          >
+            Loading your latest MEDXAI
+            analysis...
+          </p>
+        </div>
+      )}
 
       <div className="analysis-layout">
 
-        {/* ================= MRI UPLOAD ================= */}
+        {/* ====================================================
+            MRI UPLOAD
+        ==================================================== */}
 
         <div className="glass-panel upload-panel">
 
           <div className="panel-head">
-            <h3>MRI Scan</h3>
+            <h3>
+              MRI Scan
+            </h3>
           </div>
 
           <div className="scan-frame">
@@ -326,6 +953,7 @@ export default function Analyze() {
               </>
             ) : (
               <div className="drop">
+
                 <h3>
                   Upload MRI Scan
                 </h3>
@@ -338,14 +966,18 @@ export default function Analyze() {
                 <span>
                   JPG, JPEG, PNG, BMP or WEBP
                 </span>
+
               </div>
             )}
 
             <input
               type="file"
               accept="image/png,image/jpeg,image/jpg,image/webp,image/bmp"
-              onChange={handleFileChange}
+              onChange={
+                handleFileChange
+              }
             />
+
           </div>
 
           {error && (
@@ -358,7 +990,9 @@ export default function Analyze() {
             <button
               type="button"
               className="primary"
-              onClick={handleAnalyze}
+              onClick={
+                handleAnalyze
+              }
               disabled={loading}
             >
               {loading
@@ -369,7 +1003,9 @@ export default function Analyze() {
 
         </div>
 
-        {/* ================= RESULT ================= */}
+        {/* ====================================================
+            RESULT
+        ==================================================== */}
 
         <div className="glass-panel">
 
@@ -379,25 +1015,27 @@ export default function Analyze() {
             </h3>
           </div>
 
-          {!result && !loading && (
-            <div className="result-empty">
+          {!result &&
+            !loading &&
+            !restoring && (
+              <div className="result-empty">
 
-              <div className="mini-core">
-                AI
+                <div className="mini-core">
+                  AI
+                </div>
+
+                <h3>
+                  Awaiting MRI Analysis
+                </h3>
+
+                <p>
+                  Upload an MRI scan and
+                  click Analyze MRI to
+                  generate your prediction.
+                </p>
+
               </div>
-
-              <h3>
-                Awaiting MRI Analysis
-              </h3>
-
-              <p>
-                Upload an MRI scan and click
-                Analyze MRI to generate your
-                prediction.
-              </p>
-
-            </div>
-          )}
+            )}
 
           {loading && (
             <div className="result-empty">
@@ -411,8 +1049,8 @@ export default function Analyze() {
               </h3>
 
               <p>
-                EfficientNetB0 is processing
-                your scan.
+                EfficientNetB0 is
+                processing your scan.
               </p>
 
             </div>
@@ -421,11 +1059,14 @@ export default function Analyze() {
           {result && (
             <div>
 
-              {/* ================= PREDICTION ================= */}
+              {/* =================================================
+                  PREDICTION
+              ================================================= */}
 
               <div className="prediction">
 
                 <div>
+
                   <span className="eyebrow">
                     PREDICTION
                   </span>
@@ -433,6 +1074,7 @@ export default function Analyze() {
                   <h1>
                     {result.prediction}
                   </h1>
+
                 </div>
 
                 <div className="confidence">
@@ -452,156 +1094,76 @@ export default function Analyze() {
 
               </div>
 
-              {/* ================= PROBABILITIES ================= */}
+              {/* =================================================
+                  PROBABILITIES
+              ================================================= */}
 
               <div className="probabilities">
 
                 {Object.entries(
-                  result.probabilities || {}
-                ).map(([label, value]) => {
+                  result.probabilities ||
+                    {}
+                ).map(
+                  ([
+                    label,
+                    value,
+                  ]) => {
 
-                  const percentage =
-                    Number(value) * 100;
+                    const percentage =
+                      Number(value) *
+                      100;
 
-                  const width = Math.min(
-                    Math.max(percentage, 0),
-                    100
-                  );
+                    const width =
+                      Math.min(
+                        Math.max(
+                          percentage,
+                          0
+                        ),
+                        100
+                      );
 
-                  return (
-                    <div
-                      className="prob"
-                      key={label}
-                    >
-
-                      <div>
-                        <span>
-                          {label}
-                        </span>
-
-                        <strong>
-                          {percentage.toFixed(2)}
-                          %
-                        </strong>
-                      </div>
-
-                      <div className="bar">
-                        <i
-                          style={{
-                            width: `${width}%`,
-                          }}
-                        />
-                      </div>
-
-                    </div>
-                  );
-                })}
-
-              </div>
-
-              {/* ================= REPORT ================= */}
-
-              <div
-                className="glass-panel"
-                style={{
-                  marginTop: "28px",
-                  padding: "24px",
-                }}
-              >
-
-                <div className="panel-head">
-                  <div>
-                    <span className="eyebrow">
-                      CLINICAL REPORT
-                    </span>
-
-                    <h3>
-                      MRI Analysis Report
-                    </h3>
-                  </div>
-                </div>
-
-                <p
-                  style={{
-                    color: "#94a3b8",
-                    marginBottom: "18px",
-                  }}
-                >
-                  Generate a PDF report containing
-                  the MRI prediction, confidence,
-                  probability scores and
-                  explainability results.
-                </p>
-
-                {reportError && (
-                  <div className="auth-error">
-                    {reportError}
-                  </div>
-                )}
-
-                {!report && (
-                  <button
-                    type="button"
-                    className="primary"
-                    onClick={handleGenerateReport}
-                    disabled={reportLoading}
-                    style={{
-                      width: "100%",
-                      marginTop: "10px",
-                    }}
-                  >
-                    {reportLoading
-                      ? "Generating PDF Report..."
-                      : "Generate PDF Report"}
-                  </button>
-                )}
-
-                {report && (
-                  <div>
-
-                    <div
-                      style={{
-                        padding: "16px",
-                        marginBottom: "16px",
-                        borderRadius: "12px",
-                        background:
-                          "rgba(34,197,94,0.08)",
-                        border:
-                          "1px solid rgba(34,197,94,0.25)",
-                      }}
-                    >
-                      <strong>
-                        Report generated successfully
-                      </strong>
-
+                    return (
                       <div
-                        style={{
-                          marginTop: "6px",
-                          color: "#94a3b8",
-                        }}
+                        className="prob"
+                        key={label}
                       >
-                        {report.filename}
+
+                        <div>
+
+                          <span>
+                            {label}
+                          </span>
+
+                          <strong>
+                            {percentage.toFixed(
+                              2
+                            )}
+                            %
+                          </strong>
+
+                        </div>
+
+                        <div className="bar">
+
+                          <i
+                            style={{
+                              width:
+                                `${width}%`,
+                            }}
+                          />
+
+                        </div>
+
                       </div>
-
-                    </div>
-
-                    <button
-                      type="button"
-                      className="primary"
-                      onClick={handleDownloadReport}
-                      style={{
-                        width: "100%",
-                      }}
-                    >
-                      Download PDF Report
-                    </button>
-
-                  </div>
+                    );
+                  }
                 )}
 
               </div>
 
-              {/* ================= ORIGINAL MRI ================= */}
+              {/* =================================================
+                  ORIGINAL MRI
+              ================================================= */}
 
               {result.image_url && (
                 <div className="explain-preview">
@@ -620,7 +1182,9 @@ export default function Analyze() {
                 </div>
               )}
 
-              {/* ================= GRAD CAM ================= */}
+              {/* =================================================
+                  GRAD-CAM
+              ================================================= */}
 
               <div className="explain-preview">
 
@@ -650,7 +1214,9 @@ export default function Analyze() {
 
               </div>
 
-              {/* ================= LIME ================= */}
+              {/* =================================================
+                  LIME
+              ================================================= */}
 
               <div className="explain-preview">
 
@@ -659,9 +1225,46 @@ export default function Analyze() {
                 </h3>
 
                 <p>
-                  Local explanation generated
-                  for this MRI prediction.
+                  LIME identifies local image
+                  regions that contributed to
+                  the model prediction.
                 </p>
+
+                {limeLoading && (
+                  <div
+                    style={{
+                      padding:
+                        "18px",
+                      marginTop:
+                        "12px",
+                      borderRadius:
+                        "12px",
+                      background:
+                        "rgba(59,130,246,0.08)",
+                      border:
+                        "1px solid rgba(59,130,246,0.2)",
+                    }}
+                  >
+                    <p
+                      style={{
+                        margin: 0,
+                        color:
+                          "#94a3b8",
+                      }}
+                    >
+                      Generating LIME
+                      explanation...
+                      This may take a few
+                      seconds.
+                    </p>
+                  </div>
+                )}
+
+                {limeError && (
+                  <div className="auth-error">
+                    {limeError}
+                  </div>
+                )}
 
                 {result.lime_url ? (
                   <img
@@ -671,10 +1274,142 @@ export default function Analyze() {
                     alt="LIME explanation"
                   />
                 ) : (
-                  <p>
-                    LIME explanation could
-                    not be generated.
-                  </p>
+                  !limeLoading &&
+                  !limeError && (
+                    <p>
+                      LIME explanation is
+                      not available yet.
+                    </p>
+                  )
+                )}
+
+              </div>
+
+              {/* =================================================
+                  CLINICAL REPORT
+              ================================================= */}
+
+              <div
+                className="glass-panel"
+                style={{
+                  marginTop:
+                    "28px",
+                  padding:
+                    "24px",
+                }}
+              >
+
+                <div className="panel-head">
+
+                  <div>
+
+                    <span className="eyebrow">
+                      CLINICAL REPORT
+                    </span>
+
+                    <h3>
+                      MRI Analysis Report
+                    </h3>
+
+                  </div>
+
+                </div>
+
+                <p
+                  style={{
+                    color:
+                      "#94a3b8",
+                    marginBottom:
+                      "18px",
+                  }}
+                >
+                  Generate a PDF report
+                  containing the MRI
+                  prediction, confidence,
+                  probability scores and
+                  explainability results.
+                </p>
+
+                {reportError && (
+                  <div className="auth-error">
+                    {reportError}
+                  </div>
+                )}
+
+                {!report && (
+                  <button
+                    type="button"
+                    className="primary"
+                    onClick={
+                      handleGenerateReport
+                    }
+                    disabled={
+                      reportLoading
+                    }
+                    style={{
+                      width:
+                        "100%",
+                      marginTop:
+                        "10px",
+                    }}
+                  >
+                    {reportLoading
+                      ? "Generating PDF Report..."
+                      : "Generate PDF Report"}
+                  </button>
+                )}
+
+                {report && (
+                  <div>
+
+                    <div
+                      style={{
+                        padding:
+                          "16px",
+                        marginBottom:
+                          "16px",
+                        borderRadius:
+                          "12px",
+                        background:
+                          "rgba(34,197,94,0.08)",
+                        border:
+                          "1px solid rgba(34,197,94,0.25)",
+                      }}
+                    >
+
+                      <strong>
+                        Report generated
+                        successfully
+                      </strong>
+
+                      <div
+                        style={{
+                          marginTop:
+                            "6px",
+                          color:
+                            "#94a3b8",
+                        }}
+                      >
+                        {report.filename}
+                      </div>
+
+                    </div>
+
+                    <button
+                      type="button"
+                      className="primary"
+                      onClick={
+                        handleDownloadReport
+                      }
+                      style={{
+                        width:
+                          "100%",
+                      }}
+                    >
+                      Download PDF Report
+                    </button>
+
+                  </div>
                 )}
 
               </div>
@@ -689,3 +1424,4 @@ export default function Analyze() {
     </div>
   );
 }
+
