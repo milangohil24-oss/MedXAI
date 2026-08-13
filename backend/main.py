@@ -296,6 +296,41 @@ def get_profile(current_user: models.User = Depends(auth.get_current_user), db: 
 
 
 # ============================================================
+# DASHBOARD STATS (RESTORED ROUTE)
+# ============================================================
+
+@app.get("/dashboard/stats")
+def get_dashboard_stats(
+    current_user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Returns total analyses, average confidence, and latest predictions."""
+    all_analyses = (
+        db.query(models.Analysis)
+        .filter(models.Analysis.user_id == current_user.id)
+        .order_by(models.Analysis.created_at.desc())
+        .all()
+    )
+
+    total = len(all_analyses)
+    avg_confidence = (
+        sum(float(a.confidence_percentage or 0) for a in all_analyses) / total
+        if total > 0
+        else 0.0
+    )
+
+    recent = all_analyses[:5]
+    latest_prediction = recent[0].prediction if recent else None
+
+    return {
+        "total_analyses": total,
+        "average_confidence": round(avg_confidence, 2),
+        "latest_prediction": latest_prediction,
+        "recent": recent,
+    }
+
+
+# ============================================================
 # MRI PREDICTION ROUTE
 # ============================================================
 
@@ -319,9 +354,7 @@ async def predict(
     prediction_result = predict_mri(file_path)
 
     gradcam_filename = f"gradcam_{filename}"
-    lime_filename = f"lime_{filename}"
     gradcam_path = os.path.join(UPLOAD_DIR, gradcam_filename)
-    lime_path = os.path.join(UPLOAD_DIR, lime_filename)
 
     model = get_model()
     gradcam_error = None
@@ -379,7 +412,6 @@ def get_analyses(
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Retrieves full analysis history for the logged-in user."""
     return (
         db.query(models.Analysis)
         .filter(models.Analysis.user_id == current_user.id)
@@ -463,7 +495,6 @@ def get_reports(
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Retrieves full PDF reports history for the logged-in user."""
     return (
         db.query(models.Report)
         .filter(models.Report.user_id == current_user.id)
