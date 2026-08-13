@@ -500,75 +500,187 @@ def get_reports(
     )
 
 
-# ============================================================
-# GENERATE PDF REPORT
+## ============================================================
+# GENERATE ENHANCED PDF REPORT WITH FULL EXPLAINABILITY
 # ============================================================
 
 def generate_pdf_report(report_id: str, analysis: models.Analysis, pdf_path: str):
     from reportlab.lib.pagesizes import letter
     from reportlab.lib import colors
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
+    from reportlab.platypus import (
+        SimpleDocTemplate,
+        Paragraph,
+        Spacer,
+        Table,
+        TableStyle,
+        Image as RLImage,
+    )
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
-    doc = SimpleDocTemplate(pdf_path, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
+    doc = SimpleDocTemplate(
+        pdf_path,
+        pagesize=letter,
+        rightMargin=36,
+        leftMargin=36,
+        topMargin=36,
+        bottomMargin=36,
+    )
     styles = getSampleStyleSheet()
     story = []
 
-    title_style = ParagraphStyle("DocTitle", parent=styles["Heading1"], fontSize=16, textColor=colors.HexColor("#0284c7"), spaceAfter=10)
-    section_style = ParagraphStyle("Section", parent=styles["Heading2"], fontSize=12, textColor=colors.HexColor("#0f172a"), spaceBefore=6, spaceAfter=4)
-    body_style = ParagraphStyle("Body", parent=styles["BodyText"], fontSize=9, leading=13, textColor=colors.HexColor("#334155"), spaceAfter=6)
-    disclaimer_style = ParagraphStyle("Disclaimer", parent=styles["Italic"], fontSize=7.5, leading=10, textColor=colors.HexColor("#64748b"))
+    # Typography Styles
+    title_style = ParagraphStyle(
+        "DocTitle",
+        parent=styles["Heading1"],
+        fontSize=16,
+        textColor=colors.HexColor("#0284c7"),
+        spaceAfter=10,
+    )
+    section_style = ParagraphStyle(
+        "Section",
+        parent=styles["Heading2"],
+        fontSize=12,
+        textColor=colors.HexColor("#0f172a"),
+        spaceBefore=8,
+        spaceAfter=4,
+    )
+    body_style = ParagraphStyle(
+        "Body",
+        parent=styles["BodyText"],
+        fontSize=9,
+        leading=13,
+        textColor=colors.HexColor("#334155"),
+        spaceAfter=6,
+    )
+    disclaimer_style = ParagraphStyle(
+        "Disclaimer",
+        parent=styles["Italic"],
+        fontSize=7.5,
+        leading=10,
+        textColor=colors.HexColor("#64748b"),
+    )
 
     story.append(Paragraph("MEDXAI CLINICAL MRI RESEARCH REPORT", title_style))
-    story.append(Spacer(1, 8))
+    story.append(Spacer(1, 6))
 
     prediction = str(getattr(analysis, "prediction", "Unknown"))
     confidence = float(getattr(analysis, "confidence_percentage", 0) or 0)
 
+    # 1. Overview Table
     info_data = [
         [Paragraph("<b>Report ID:</b>", styles["Normal"]), Paragraph(str(report_id), styles["Normal"])],
         [Paragraph("<b>Scan Filename:</b>", styles["Normal"]), Paragraph(str(getattr(analysis, "filename", "")), styles["Normal"])],
         [Paragraph("<b>Classification:</b>", styles["Normal"]), Paragraph(f"<b>{prediction}</b>", styles["Normal"])],
-        [Paragraph("<b>Confidence:</b>", styles["Normal"]), Paragraph(f"{confidence:.2f}%", styles["Normal"])],
+        [Paragraph("<b>Confidence:</b>", styles["Normal"]), Paragraph(f"<b>{confidence:.2f}%</b>", styles["Normal"])],
     ]
 
     info_table = Table(info_data, colWidths=[140, 360])
-    info_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f8fafc")),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
-        ("PADDING", (0, 0), (-1, -1), 4),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-    ]))
+    info_table.setStyle(
+        TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f8fafc")),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+            ("PADDING", (0, 0), (-1, -1), 4),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ])
+    )
 
     story.append(info_table)
-    story.append(Spacer(1, 10))
+    story.append(Spacer(1, 8))
 
-    story.append(Paragraph("AI Diagnostic Summary", section_style))
-    story.append(Paragraph(f"The MEDXAI model analyzed the scan as <b>{prediction}</b> at <b>{confidence:.2f}%</b> confidence.", body_style))
+    # 2. Probability Breakdown Table
+    probs = getattr(analysis, "probabilities", {}) or {}
+    if probs:
+        story.append(Paragraph("Stage Probability Distribution", section_style))
+        prob_rows = [["Alzheimer's Stage", "Probability Score"]]
+        for stage, score in probs.items():
+            try:
+                score_pct = f"{float(score) * 100:.2f}%" if float(score) <= 1.0 else f"{float(score):.2f}%"
+            except Exception:
+                score_pct = str(score)
+            prob_rows.append([stage, score_pct])
 
-    # Add MRI
+        prob_table = Table(prob_rows, colWidths=[250, 250])
+        prob_table.setStyle(
+            TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e2e8f0")),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+                ("PADDING", (0, 0), (-1, -1), 4),
+            ])
+        )
+        story.append(prob_table)
+        story.append(Spacer(1, 8))
+
+    # 3. Visualizations Side-by-Side Table (Original MRI, Grad-CAM, LIME)
+    story.append(Paragraph("Visual Explainability Analysis", section_style))
+
+    visual_images = []
+    visual_titles = []
+
+    # Original MRI
     image_rel = getattr(analysis, "image_url", "")
     if image_rel and image_rel.startswith("/uploads/"):
         image_path = os.path.join(UPLOAD_DIR, image_rel.replace("/uploads/", ""))
         if os.path.exists(image_path):
-            story.append(Paragraph("Original MRI Scan", section_style))
-            story.append(RLImage(image_path, width=150, height=150))
-            story.append(Spacer(1, 8))
+            visual_titles.append(Paragraph("<b>Original MRI Scan</b>", styles["Normal"]))
+            visual_images.append(RLImage(image_path, width=140, height=140))
 
-    # Add Grad-CAM
+    # Grad-CAM
     gradcam_rel = getattr(analysis, "gradcam_url", "")
     if gradcam_rel and gradcam_rel.startswith("/uploads/"):
         gradcam_path = os.path.join(UPLOAD_DIR, gradcam_rel.replace("/uploads/", ""))
         if os.path.exists(gradcam_path) and os.path.getsize(gradcam_path) > 100:
-            story.append(Paragraph("Grad-CAM Heatmap", section_style))
-            story.append(RLImage(gradcam_path, width=150, height=150))
-            story.append(Spacer(1, 8))
+            visual_titles.append(Paragraph("<b>Grad-CAM Heatmap</b>", styles["Normal"]))
+            visual_images.append(RLImage(gradcam_path, width=140, height=140))
 
-    story.append(Paragraph("<b>DISCLAIMER:</b> For clinical decision support only.", disclaimer_style))
+    # LIME
+    lime_rel = getattr(analysis, "lime_url", "")
+    if lime_rel and lime_rel.startswith("/uploads/"):
+        lime_path = os.path.join(UPLOAD_DIR, lime_rel.replace("/uploads/", ""))
+        if os.path.exists(lime_path) and os.path.getsize(lime_path) > 100:
+            visual_titles.append(Paragraph("<b>LIME Feature Attribution</b>", styles["Normal"]))
+            visual_images.append(RLImage(lime_path, width=140, height=140))
+
+    if visual_images:
+        col_w = 500 // len(visual_images)
+        vis_table = Table([visual_titles, visual_images], colWidths=[col_w] * len(visual_images))
+        vis_table.setStyle(
+            TableStyle([
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("PADDING", (0, 0), (-1, -1), 4),
+            ])
+        )
+        story.append(vis_table)
+        story.append(Spacer(1, 8))
+
+    # 4. Clinical Explanation Text
+    story.append(Paragraph("Explainable AI Findings", section_style))
+    story.append(
+        Paragraph(
+            f"The deep learning architecture evaluated brain MRI structural features and classified "
+            f"biomarkers consistent with <b>{prediction}</b> at a confidence level of <b>{confidence:.2f}%</b>.<br/><br/>"
+            f"• <b>Grad-CAM:</b> Highlights high-attention convolutional activation zones (red/yellow regions) "
+            f"corresponding to structural tissue atrophy or ventricular expansion.<br/>"
+            f"• <b>LIME:</b> Superpixel attribution isolates local pixel groups contributing positively (red) "
+            f"or negatively (blue) toward the classifier's diagnosis.",
+            body_style,
+        )
+    )
+
+    story.append(
+        Paragraph(
+            "<b>DISCLAIMER:</b> This report is generated for research and decision-support purposes only.",
+            disclaimer_style,
+        )
+    )
 
     doc.build(story)
     gc.collect()
 
+
+# ============================================================
+# REPORT ROUTE HANDLERS
+# ============================================================
 
 @app.post("/reports/{id}")
 def create_report(
@@ -576,7 +688,11 @@ def create_report(
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
 ):
-    analysis = db.query(models.Analysis).filter(models.Analysis.id == id, models.Analysis.user_id == current_user.id).first()
+    analysis = (
+        db.query(models.Analysis)
+        .filter(models.Analysis.id == id, models.Analysis.user_id == current_user.id)
+        .first()
+    )
     if not analysis:
         raise HTTPException(status_code=404, detail="Analysis not found")
 
@@ -617,7 +733,11 @@ def download_report(
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
 ):
-    report = db.query(models.Report).filter(models.Report.id == id, models.Report.user_id == current_user.id).first()
+    report = (
+        db.query(models.Report)
+        .filter(models.Report.id == id, models.Report.user_id == current_user.id)
+        .first()
+    )
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
 
