@@ -30,59 +30,49 @@ def make_gradcam_heatmap(image_path, model, pred_index=None):
     original_image, img_array = load_image(image_path)
     img_tensor = tf.convert_to_tensor(img_array, dtype=tf.float32)
 
-    # Find base model and classifier layers
-    base_model = None
+    # 1. Separate nested backbone layer from classifier layers
+    base_layer = None
     classifier_layers = []
 
     for layer in model.layers:
-        if isinstance(layer, tf.keras.Model) or "efficientnet" in layer.name.lower():
-            base_model = layer
-        elif base_model is not None:
+        if isinstance(layer, tf.keras.Model) or "efficient" in layer.name.lower():
+            base_layer = layer
+        elif base_layer is not None:
             classifier_layers.append(layer)
 
-    if base_model is None:
-        base_model = model
+    if base_layer is None:
+        base_layer = model
         classifier_layers = []
 
-    # Find last 4D conv layer inside base_model
-    target_layer = None
-    target_layer_idx = -1
-    for idx, layer in enumerate(base_model.layers):
+    # 2. Locate 4D convolutional feature layer inside the base backbone
+    target_conv = None
+    for layer in reversed(base_layer.layers):
         try:
-            shape = layer.output_shape
-            if len(shape) == 4 and shape[1] is not None:
-                target_layer = layer
-                target_layer_idx = idx
+            if len(layer.output_shape) == 4:
+                target_conv = layer
+                break
         except Exception:
             continue
 
-    if target_layer is None:
-        raise ValueError("No 4D convolutional layer found in model.")
+    if target_conv is None:
+        raise ValueError("No 4D convolutional feature layer found.")
 
-    # Construct feature extractor sub-model
-    conv_extractor = tf.keras.Model(
-        inputs=base_model.inputs,
-        outputs=target_layer.output
+    # 3. Create sub-model ONLY for base_layer to prevent Graph Disconnection
+    base_grad_model = tf.keras.models.Model(
+        inputs=base_layer.inputs,
+        outputs=[target_conv.output, base_layer.output]
     )
 
-    remaining_base_layers = base_model.layers[target_layer_idx + 1:]
-
     with tf.GradientTape() as tape:
-        conv_outputs = conv_extractor(img_tensor, training=False)
+        conv_outputs, base_output = base_grad_model(img_tensor, training=False)
         tape.watch(conv_outputs)
 
-        x = conv_outputs
-        for layer in remaining_base_layers:
+        x = base_output
+        for c_layer in classifier_layers:
             try:
-                x = layer(x, training=False)
+                x = c_layer(x, training=False)
             except Exception:
-                x = layer(x)
-
-        for layer in classifier_layers:
-            try:
-                x = layer(x, training=False)
-            except Exception:
-                x = layer(x)
+                x = c_layer(x)
 
         predictions = x
         if pred_index is None:
@@ -94,7 +84,7 @@ def make_gradcam_heatmap(image_path, model, pred_index=None):
     grads = tape.gradient(class_output, conv_outputs)
 
     if grads is None:
-        raise ValueError("Gradients could not be computed.")
+        raise ValueError("Gradients could not be derived.")
 
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
     conv_outputs_val = conv_outputs[0]
@@ -109,7 +99,7 @@ def make_gradcam_heatmap(image_path, model, pred_index=None):
     pred_array = predictions.numpy()[0]
     pred_idx_int = int(pred_index.numpy() if isinstance(pred_index, tf.Tensor) else pred_index)
 
-    del conv_extractor, grads, pooled_grads
+    del base_grad_model, grads, pooled_grads
     gc.collect()
 
     return heatmap_np, original_image, pred_idx_int, pred_array
