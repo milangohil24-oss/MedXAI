@@ -1,5 +1,5 @@
-
 import os
+import gc
 import json
 import numpy as np
 from PIL import Image
@@ -153,10 +153,19 @@ def predict_mri(
         image_path
     )
 
-    predictions = model.predict(
+    # --------------------------------------------------------
+    # DIRECT TENSOR EVALUATION (PREVENTS KERAS MEMORY LEAKS)
+    # --------------------------------------------------------
+
+    img_tensor = tf.convert_to_tensor(
         processed_img,
-        verbose=0
+        dtype=tf.float32
     )
+
+    predictions = model(
+        img_tensor,
+        training=False
+    ).numpy()
 
     preds = np.asarray(
         predictions,
@@ -274,6 +283,12 @@ def predict_mri(
             probabilities[class_name] = 0.0
 
     # --------------------------------------------------------
+    # MEMORY CLEANUP
+    # --------------------------------------------------------
+
+    gc.collect()
+
+    # --------------------------------------------------------
     # RESULT
     # --------------------------------------------------------
 
@@ -290,4 +305,3 @@ def predict_mri(
 
         "probabilities": probabilities
     }
-
