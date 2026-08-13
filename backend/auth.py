@@ -6,10 +6,8 @@ import bcrypt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
-from sqlalchemy.orm import Session
 
-from .database import get_db
-from . import models
+from .database import users_collection
 
 
 # ============================================================
@@ -110,12 +108,11 @@ def create_access_token(
 
 
 # ============================================================
-# GET CURRENT USER
+# GET CURRENT USER (MONGODB ATLAS)
 # ============================================================
 
 def get_current_user(
-    token: str = Depends(oauth2_scheme),
-    db: Session = Depends(get_db)
+    token: str = Depends(oauth2_scheme)
 ):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -140,15 +137,10 @@ def get_current_user(
     except JWTError:
         raise credentials_exception
 
-    user = (
-        db.query(models.User)
-        .filter(
-            models.User.id == user_id
-        )
-        .first()
-    )
+    user = users_collection.find_one({"_id": user_id})
 
     if user is None:
         raise credentials_exception
 
+    user["id"] = user["_id"]
     return user
