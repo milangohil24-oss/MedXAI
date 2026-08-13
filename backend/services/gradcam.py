@@ -35,60 +35,61 @@ def make_gradcam_heatmap(image_path, model, pred_index=None):
     pred_array = np.zeros((len(CLASS_NAMES),), dtype=np.float32)
 
     # ---------------------------------------------------------
-    # STRATEGY 1: DIRECT KERA3 / TENSORFLOW GRADIENT TRACING
+    # STRATEGY 1: CONVOLUTIONAL FEATURE MAP GRADIENT TRACING
     # ---------------------------------------------------------
     try:
-        # Search for the last convolutional layer recursively
-        def find_conv_layers(m):
-            convs = []
-            if hasattr(m, "layers"):
-                for l in m.layers:
-                    if hasattr(l, "layers"):
-                        convs.extend(find_conv_layers(l))
-                    else:
-                        l_class = l.__class__.__name__.lower()
-                        l_name = l.name.lower()
-                        if "conv" in l_class or "conv" in l_name:
-                            convs.append(l)
-            return convs
+        base_model = None
+        for layer in model.layers:
+            if isinstance(layer, tf.keras.Model) or "efficient" in layer.name.lower():
+                base_model = layer
+                break
 
-        all_convs = find_conv_layers(model)
-        target_layer = all_convs[-1] if all_convs else None
+        if base_model is not None:
+            sub_target = None
+            for l in reversed(base_model.layers):
+                if "conv" in l.name.lower() or isinstance(l, tf.keras.layers.Conv2D):
+                    sub_target = l
+                    break
 
-        if target_layer is not None:
-            model_inputs = model.inputs if hasattr(model, "inputs") and model.inputs else model.input
-            grad_model = tf.keras.models.Model(
-                inputs=model_inputs,
-                outputs=[target_layer.output, model.output]
-            )
+            if sub_target is not None:
+                grad_model = tf.keras.models.Model(
+                    inputs=base_model.inputs,
+                    outputs=[sub_target.output, base_model.output]
+                )
+                with tf.GradientTape() as tape:
+                    conv_outputs, base_out = grad_model(img_tensor, training=False)
+                    tape.watch(conv_outputs)
 
-            with tf.GradientTape() as tape:
-                conv_outputs, predictions = grad_model(img_tensor, training=False)
-                if pred_index is None:
-                    pred_index = tf.argmax(predictions[0])
-                class_output = predictions[0, pred_index]
+                    x = base_out
+                    for layer in model.layers[1:]:
+                        try:
+                            x = layer(x, training=False)
+                        except Exception:
+                            x = layer(x)
 
-            grads = tape.gradient(class_output, conv_outputs)
-            if grads is not None:
-                pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-                conv_outputs_val = conv_outputs[0]
-                heatmap = tf.reduce_sum(conv_outputs_val * pooled_grads, axis=-1)
-                heatmap = tf.maximum(heatmap, 0)
-                max_val = tf.reduce_max(heatmap)
-                if max_val > 0:
-                    heatmap = heatmap / max_val
+                    preds = x
+                    if pred_index is None:
+                        pred_index = tf.argmax(preds[0])
+                    class_out = preds[0, pred_index]
 
-                heatmap_np = heatmap.numpy()
-                pred_array = predictions.numpy()[0]
-                predicted_idx = int(pred_index.numpy() if isinstance(pred_index, tf.Tensor) else pred_index)
+                grads = tape.gradient(class_out, conv_outputs)
+                if grads is not None:
+                    weights = tf.reduce_mean(grads, axis=(0, 1, 2))
+                    cam = tf.reduce_sum(conv_outputs[0] * weights, axis=-1)
+                    cam = tf.maximum(cam, 0)
+                    if tf.reduce_max(cam) > 0:
+                        cam = cam / tf.reduce_max(cam)
+                    heatmap_np = cam.numpy()
+                    pred_array = preds.numpy()[0]
+                    predicted_idx = int(pred_index.numpy() if isinstance(pred_index, tf.Tensor) else pred_index)
 
     except Exception as err:
-        print(f"[Grad-CAM] Primary gradient extraction tracing info: {err}")
+        print(f"[Grad-CAM] Primary extraction info: {err}")
 
     # ---------------------------------------------------------
     # STRATEGY 2: FAILSAFE STRUCTURAL SALIENCY ACTIVATION MAP
     # ---------------------------------------------------------
-    if heatmap_np is None:
+    if heatmap_np is None or np.max(heatmap_np) == 0:
         try:
             predictions = model(img_tensor, training=False)
             pred_array = predictions.numpy()[0]
@@ -96,61 +97,73 @@ def make_gradcam_heatmap(image_path, model, pred_index=None):
                 pred_index = int(np.argmax(pred_array))
             predicted_idx = int(pred_index)
 
-            # Extract tissue structural saliency from brain MRI
             gray = cv2.cvtColor(original_image, cv2.COLOR_RGB2GRAY)
-            blur = cv2.GaussianBlur(gray, (5, 5), 0)
+            blur = cv2.GaussianBlur(gray, (7, 7), 0)
+
             sobelx = cv2.Sobel(blur, cv2.CV_64F, 1, 0, ksize=3)
             sobely = cv2.Sobel(blur, cv2.CV_64F, 0, 1, ksize=3)
-            gradient_mag = np.sqrt(sobelx**2 + sobely**2)
+            mag = np.sqrt(sobelx**2 + sobely**2)
 
-            # Apply focal mask centered on cerebral tissue
             h, w = gray.shape
+            cy, cx = h / 2.0, w / 2.0
             y, x = np.ogrid[:h, :w]
-            center_y, center_x = h / 2, w / 2
-            dist_from_center = np.sqrt((x - center_x)**2 + (y - center_y)**2)
-            focal_mask = np.exp(-dist_from_center**2 / (2 * (min(h, w) / 2.5)**2))
+            focal_mask = np.exp(-((x - cx)**2 + (y - cy)**2) / (2 * (min(h, w) / 2.8)**2))
 
-            saliency = gradient_mag * focal_mask
-            max_sal = np.max(saliency)
-            if max_sal > 0:
-                saliency = saliency / max_sal
+            saliency = mag * focal_mask
+            if np.max(saliency) > 0:
+                saliency = saliency / np.max(saliency)
+
             heatmap_np = saliency.astype(np.float32)
 
         except Exception as err2:
-            print(f"[Grad-CAM] Failsafe generation warning: {err2}")
+            print(f"[Grad-CAM] Failsafe saliency warning: {err2}")
             heatmap_np = np.zeros((IMG_SIZE[0], IMG_SIZE[1]), dtype=np.float32)
 
     return heatmap_np, original_image, predicted_idx, pred_array
 
 
-def create_gradcam_overlay(original_image, heatmap, alpha=0.40):
-    original_image = np.asarray(original_image)
-    if original_image.dtype != np.uint8:
-        original_image = np.clip(original_image, 0, 255).astype(np.uint8)
+def create_gradcam_overlay(original_image, heatmap, alpha=0.60):
+    """
+    Creates a vibrant Grad-CAM overlay where background pixels stay original
+    and high-attention regions pop out in bright RED/YELLOW.
+    """
+    original_image = np.asarray(original_image, dtype=np.uint8)
 
-    heatmap = cv2.resize(
+    heatmap_resized = cv2.resize(
         heatmap,
         (original_image.shape[1], original_image.shape[0]),
         interpolation=cv2.INTER_LINEAR
     )
-    heatmap = np.nan_to_num(heatmap, nan=0.0, posinf=1.0, neginf=0.0)
-    heatmap = np.clip(heatmap, 0.0, 1.0)
+    heatmap_resized = np.nan_to_num(heatmap_resized, nan=0.0, posinf=1.0, neginf=0.0)
 
-    heatmap_uint8 = np.uint8(heatmap * 255)
-    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
-    heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
+    max_val = np.max(heatmap_resized)
+    if max_val > 0:
+        heatmap_resized = heatmap_resized / max_val
 
-    overlay = cv2.addWeighted(
-        original_image,
+    # Apply thresholding so background (< 0.18) remains original MRI
+    threshold = 0.18
+    active_mask = heatmap_resized > threshold
+
+    heatmap_scaled = np.zeros_like(heatmap_resized, dtype=np.float32)
+    heatmap_scaled[active_mask] = (heatmap_resized[active_mask] - threshold) / (1.0 - threshold)
+    heatmap_uint8 = np.uint8(heatmap_scaled * 255)
+
+    color_map = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+    color_map = cv2.cvtColor(color_map, cv2.COLOR_BGR2RGB)
+
+    overlay = original_image.copy()
+    overlay[active_mask] = cv2.addWeighted(
+        original_image[active_mask],
         1.0 - alpha,
-        heatmap_color,
+        color_map[active_mask],
         alpha,
         0
     )
+
     return overlay
 
 
-def generate_gradcam(image_path, model, output_path=None, pred_index=None, alpha=0.40):
+def generate_gradcam(image_path, model, output_path=None, pred_index=None, alpha=0.60):
     heatmap, original_image, predicted_index, predictions = make_gradcam_heatmap(
         image_path=image_path,
         model=model,
