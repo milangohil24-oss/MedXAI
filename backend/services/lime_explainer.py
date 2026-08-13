@@ -1,5 +1,5 @@
-
 import os
+import gc
 
 import cv2
 import numpy as np
@@ -121,7 +121,7 @@ def generate_lime_explanation(
     )
 
     # --------------------------------------------------------
-    # GENERATE EXPLANATION
+    # GENERATE EXPLANATION (OPTIMIZED FOR 512MB RAM)
     # --------------------------------------------------------
 
     try:
@@ -130,8 +130,8 @@ def generate_lime_explanation(
             predict_fn,
             top_labels=1,
             hide_color=0,
-            num_samples=100,
-            batch_size=10,
+            num_samples=25,  # Reduced from 100/1000 to 25 to prevent OOM
+            batch_size=1,    # Process 1 perturbed image at a time
         )
     except Exception as error:
         raise RuntimeError(
@@ -201,8 +201,6 @@ def generate_lime_explanation(
     # BUILD LIME VISUALIZATION
     # --------------------------------------------------------
 
-    # Use the original MRI as the base instead of allowing
-    # LIME to replace large areas with its hidden color.
     base = (
         original.astype(np.float32)
         / 255.0
@@ -227,15 +225,10 @@ def generate_lime_explanation(
         dtype=np.uint8,
     )
 
-    # Positive LIME regions are highlighted.
-    #
-    # OpenCV uses BGR internally.
-    # Red in BGR = (0, 0, 255)
     overlay[
         positive_mask_binary > 0
     ] = (0, 0, 255)
 
-    # Negative/other selected regions are shown in blue.
     negative_mask_binary = (
         (all_features_mask < 0)
         & (positive_mask_binary == 0)
@@ -279,7 +272,6 @@ def generate_lime_explanation(
         255,
     ).astype(np.uint8)
 
-    # Convert RGB → BGR for OpenCV.
     final_image = cv2.cvtColor(
         boundary_image,
         cv2.COLOR_RGB2BGR,
@@ -300,7 +292,6 @@ def generate_lime_explanation(
         dtype=np.uint8,
     )
 
-    # Keep the title area dark.
     canvas[
         title_height:
     ] = final_image
@@ -338,20 +329,22 @@ def generate_lime_explanation(
     # VALIDATE OUTPUT
     # --------------------------------------------------------
 
-    if not os.path.exists(
-        output_path
-    ):
+    if not os.path.exists(output_path):
         raise RuntimeError(
             "LIME output file was not created."
         )
 
-    file_size = os.path.getsize(
-        output_path
-    )
+    file_size = os.path.getsize(output_path)
 
     if file_size <= 1000:
         raise RuntimeError(
             "Generated LIME image is unexpectedly small."
         )
+
+    # --------------------------------------------------------
+    # GARBAGE COLLECTION FOR LOW RAM INSTANCES
+    # --------------------------------------------------------
+
+    gc.collect()
 
     return output_path
