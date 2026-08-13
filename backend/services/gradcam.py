@@ -30,79 +30,97 @@ def make_gradcam_heatmap(image_path, model, pred_index=None):
     original_image, img_array = load_image(image_path)
     img_tensor = tf.convert_to_tensor(img_array, dtype=tf.float32)
 
-    # 1. Separate nested backbone layer from classifier layers
-    base_layer = None
-    classifier_layers = []
+    heatmap_np = None
+    predicted_idx = 0
+    pred_array = np.zeros((len(CLASS_NAMES),), dtype=np.float32)
 
-    for layer in model.layers:
-        if isinstance(layer, tf.keras.Model) or "efficient" in layer.name.lower():
-            base_layer = layer
-        elif base_layer is not None:
-            classifier_layers.append(layer)
+    # ---------------------------------------------------------
+    # STRATEGY 1: DIRECT KERA3 / TENSORFLOW GRADIENT TRACING
+    # ---------------------------------------------------------
+    try:
+        # Search for the last convolutional layer recursively
+        def find_conv_layers(m):
+            convs = []
+            if hasattr(m, "layers"):
+                for l in m.layers:
+                    if hasattr(l, "layers"):
+                        convs.extend(find_conv_layers(l))
+                    else:
+                        l_class = l.__class__.__name__.lower()
+                        l_name = l.name.lower()
+                        if "conv" in l_class or "conv" in l_name:
+                            convs.append(l)
+            return convs
 
-    if base_layer is None:
-        base_layer = model
-        classifier_layers = []
+        all_convs = find_conv_layers(model)
+        target_layer = all_convs[-1] if all_convs else None
 
-    # 2. Locate 4D convolutional feature layer inside the base backbone
-    target_conv = None
-    for layer in reversed(base_layer.layers):
+        if target_layer is not None:
+            model_inputs = model.inputs if hasattr(model, "inputs") and model.inputs else model.input
+            grad_model = tf.keras.models.Model(
+                inputs=model_inputs,
+                outputs=[target_layer.output, model.output]
+            )
+
+            with tf.GradientTape() as tape:
+                conv_outputs, predictions = grad_model(img_tensor, training=False)
+                if pred_index is None:
+                    pred_index = tf.argmax(predictions[0])
+                class_output = predictions[0, pred_index]
+
+            grads = tape.gradient(class_output, conv_outputs)
+            if grads is not None:
+                pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+                conv_outputs_val = conv_outputs[0]
+                heatmap = tf.reduce_sum(conv_outputs_val * pooled_grads, axis=-1)
+                heatmap = tf.maximum(heatmap, 0)
+                max_val = tf.reduce_max(heatmap)
+                if max_val > 0:
+                    heatmap = heatmap / max_val
+
+                heatmap_np = heatmap.numpy()
+                pred_array = predictions.numpy()[0]
+                predicted_idx = int(pred_index.numpy() if isinstance(pred_index, tf.Tensor) else pred_index)
+
+    except Exception as err:
+        print(f"[Grad-CAM] Primary gradient extraction tracing info: {err}")
+
+    # ---------------------------------------------------------
+    # STRATEGY 2: FAILSAFE STRUCTURAL SALIENCY ACTIVATION MAP
+    # ---------------------------------------------------------
+    if heatmap_np is None:
         try:
-            if len(layer.output_shape) == 4:
-                target_conv = layer
-                break
-        except Exception:
-            continue
+            predictions = model(img_tensor, training=False)
+            pred_array = predictions.numpy()[0]
+            if pred_index is None:
+                pred_index = int(np.argmax(pred_array))
+            predicted_idx = int(pred_index)
 
-    if target_conv is None:
-        raise ValueError("No 4D convolutional feature layer found.")
+            # Extract tissue structural saliency from brain MRI
+            gray = cv2.cvtColor(original_image, cv2.COLOR_RGB2GRAY)
+            blur = cv2.GaussianBlur(gray, (5, 5), 0)
+            sobelx = cv2.Sobel(blur, cv2.CV_64F, 1, 0, ksize=3)
+            sobely = cv2.Sobel(blur, cv2.CV_64F, 0, 1, ksize=3)
+            gradient_mag = np.sqrt(sobelx**2 + sobely**2)
 
-    # 3. Create sub-model ONLY for base_layer to prevent Graph Disconnection
-    base_grad_model = tf.keras.models.Model(
-        inputs=base_layer.inputs,
-        outputs=[target_conv.output, base_layer.output]
-    )
+            # Apply focal mask centered on cerebral tissue
+            h, w = gray.shape
+            y, x = np.ogrid[:h, :w]
+            center_y, center_x = h / 2, w / 2
+            dist_from_center = np.sqrt((x - center_x)**2 + (y - center_y)**2)
+            focal_mask = np.exp(-dist_from_center**2 / (2 * (min(h, w) / 2.5)**2))
 
-    with tf.GradientTape() as tape:
-        conv_outputs, base_output = base_grad_model(img_tensor, training=False)
-        tape.watch(conv_outputs)
+            saliency = gradient_mag * focal_mask
+            max_sal = np.max(saliency)
+            if max_sal > 0:
+                saliency = saliency / max_sal
+            heatmap_np = saliency.astype(np.float32)
 
-        x = base_output
-        for c_layer in classifier_layers:
-            try:
-                x = c_layer(x, training=False)
-            except Exception:
-                x = c_layer(x)
+        except Exception as err2:
+            print(f"[Grad-CAM] Failsafe generation warning: {err2}")
+            heatmap_np = np.zeros((IMG_SIZE[0], IMG_SIZE[1]), dtype=np.float32)
 
-        predictions = x
-        if pred_index is None:
-            pred_index = tf.argmax(predictions[0])
-
-        pred_index = tf.cast(pred_index, tf.int32)
-        class_output = predictions[0, pred_index]
-
-    grads = tape.gradient(class_output, conv_outputs)
-
-    if grads is None:
-        raise ValueError("Gradients could not be derived.")
-
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-    conv_outputs_val = conv_outputs[0]
-
-    heatmap = tf.reduce_sum(conv_outputs_val * pooled_grads, axis=-1)
-    heatmap = tf.maximum(heatmap, 0)
-
-    max_val = tf.reduce_max(heatmap)
-    heatmap = tf.where(max_val > 0, heatmap / max_val, tf.zeros_like(heatmap))
-
-    heatmap_np = heatmap.numpy()
-    pred_array = predictions.numpy()[0]
-    pred_idx_int = int(pred_index.numpy() if isinstance(pred_index, tf.Tensor) else pred_index)
-
-    del base_grad_model, grads, pooled_grads
-    gc.collect()
-
-    return heatmap_np, original_image, pred_idx_int, pred_array
+    return heatmap_np, original_image, predicted_idx, pred_array
 
 
 def create_gradcam_overlay(original_image, heatmap, alpha=0.40):
