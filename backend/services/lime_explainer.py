@@ -3,6 +3,7 @@ import gc
 
 import cv2
 import numpy as np
+import tensorflow as tf
 from PIL import Image
 
 from lime import lime_image
@@ -78,32 +79,17 @@ def generate_lime_explanation(
     )
 
     # --------------------------------------------------------
-    # MODEL PREDICTION FUNCTION
+    # MODEL PREDICTION FUNCTION (NO Keras Memory Leaks)
     # --------------------------------------------------------
 
     def predict_fn(images):
         """
         LIME calls this function with batches of perturbed images.
+        Direct callable model(...) avoids TensorFlow memory leaks.
         """
+        images_tensor = tf.convert_to_tensor(images, dtype=tf.float32)
+        predictions = model(images_tensor, training=False).numpy()
 
-        images = np.asarray(
-            images,
-            dtype=np.float32,
-        )
-
-        predictions = model.predict(
-            images,
-            verbose=0,
-        )
-
-        predictions = np.asarray(
-            predictions,
-            dtype=np.float32,
-        )
-
-        # Safety normalization.
-        # Normally the EfficientNet model already returns
-        # probabilities because its final layer is softmax.
         if predictions.ndim != 2:
             raise RuntimeError(
                 "Model prediction output must be a 2D "
