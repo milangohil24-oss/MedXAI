@@ -122,10 +122,10 @@ def make_gradcam_heatmap(image_path, model, pred_index=None):
     return heatmap_np, original_image, predicted_idx, pred_array
 
 
-def create_gradcam_overlay(original_image, heatmap, alpha=0.60):
+def create_gradcam_overlay(original_image, heatmap, alpha=0.75):
     """
-    Creates a vibrant Grad-CAM overlay where background pixels stay original
-    and high-attention regions pop out in bright RED/YELLOW.
+    Overlays a high-intensity (>75% opacity) Grad-CAM heatmap with power-scaling
+    to make red and yellow attention zones stand out prominently.
     """
     original_image = np.asarray(original_image, dtype=np.uint8)
 
@@ -140,13 +140,16 @@ def create_gradcam_overlay(original_image, heatmap, alpha=0.60):
     if max_val > 0:
         heatmap_resized = heatmap_resized / max_val
 
-    # Apply thresholding so background (< 0.18) remains original MRI
-    threshold = 0.18
+    # Lower cutoff threshold (0.08) so more feature regions are captured
+    threshold = 0.08
     active_mask = heatmap_resized > threshold
 
     heatmap_scaled = np.zeros_like(heatmap_resized, dtype=np.float32)
     heatmap_scaled[active_mask] = (heatmap_resized[active_mask] - threshold) / (1.0 - threshold)
-    heatmap_uint8 = np.uint8(heatmap_scaled * 255)
+    
+    # Power curve scaling to expand heat intensity coverage
+    heatmap_scaled = np.power(heatmap_scaled, 0.70)
+    heatmap_uint8 = np.uint8(np.clip(heatmap_scaled * 255.0, 0, 255))
 
     color_map = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
     color_map = cv2.cvtColor(color_map, cv2.COLOR_BGR2RGB)
@@ -163,7 +166,7 @@ def create_gradcam_overlay(original_image, heatmap, alpha=0.60):
     return overlay
 
 
-def generate_gradcam(image_path, model, output_path=None, pred_index=None, alpha=0.60):
+def generate_gradcam(image_path, model, output_path=None, pred_index=None, alpha=0.75):
     heatmap, original_image, predicted_index, predictions = make_gradcam_heatmap(
         image_path=image_path,
         model=model,
