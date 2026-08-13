@@ -296,7 +296,7 @@ def get_profile(current_user: models.User = Depends(auth.get_current_user), db: 
 
 
 # ============================================================
-# DASHBOARD STATS (RESTORED ROUTE)
+# DASHBOARD STATS
 # ============================================================
 
 @app.get("/dashboard/stats")
@@ -304,7 +304,6 @@ def get_dashboard_stats(
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Returns total analyses, average confidence, and latest predictions."""
     all_analyses = (
         db.query(models.Analysis)
         .filter(models.Analysis.user_id == current_user.id)
@@ -383,7 +382,6 @@ async def predict(
     db.commit()
     db.refresh(analysis_record)
 
-    tf.keras.backend.clear_session()
     gc.collect()
 
     return {
@@ -480,7 +478,6 @@ def get_lime_explain(
     db.commit()
     db.refresh(record)
 
-    tf.keras.backend.clear_session()
     gc.collect()
 
     return {"analysis_id": record.id, "url": f"/uploads/{lime_filename}", "features": []}
@@ -512,9 +509,6 @@ def generate_pdf_report(report_id: str, analysis: models.Analysis, pdf_path: str
     from reportlab.lib import colors
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-
-    tf.keras.backend.clear_session()
-    gc.collect()
 
     doc = SimpleDocTemplate(pdf_path, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
     styles = getSampleStyleSheet()
