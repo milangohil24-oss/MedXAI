@@ -1,9 +1,21 @@
 import os
-import gc
+# Force CPU-only mode before TensorFlow initializes
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
 import json
+import gc
 import numpy as np
 from PIL import Image
 import tensorflow as tf
+
+# Disable physical GPU devices explicitly
+try:
+    tf.config.set_visible_devices([], 'GPU')
+except Exception:
+    pass
+
+# ... (keep the rest of your prediction.py code as is) ...
 
 
 # ============================================================
