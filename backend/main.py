@@ -67,8 +67,6 @@ Base.metadata.create_all(bind=engine)
 # ============================================================
 # DATABASE SCHEMA COMPATIBILITY
 # ============================================================
-# Older databases may not have the "role" column.
-# Add it automatically if necessary.
 
 try:
     user_columns = {
@@ -174,22 +172,13 @@ app = FastAPI(
 # ============================================================
 
 def _normalize_origin(value: str) -> str:
-    """Normalize CORS origins from environment variables.
-
-    This also repairs accidental Markdown-style values such as:
-    [https://example.com](https://example.com)
-    which can otherwise cause browsers to reject CORS requests.
-    """
-
     value = str(value or "").strip()
 
     if not value:
         return ""
 
-    # Remove surrounding quotes commonly introduced in env settings.
     value = value.strip('\"\'')
 
-    # Convert Markdown link syntax to the actual origin.
     if value.startswith("[") and "](" in value:
         value = value[1:value.find("](")]
 
@@ -208,7 +197,6 @@ configured_origins = os.getenv(
     "",
 ).strip()
 
-# Explicit origins used by the deployed frontend and local development.
 origins = [
     frontend_url,
     "https://medxai-frontend.onrender.com",
@@ -218,15 +206,12 @@ origins = [
     "http://127.0.0.1:5173",
 ]
 
-# Add extra origins from the CORS_ORIGINS environment variable.
-# Commas, semicolons, and newlines are accepted.
 if configured_origins:
     for raw_origin in configured_origins.replace(";", ",").replace("\n", ",").split(","):
         normalized = _normalize_origin(raw_origin)
         if normalized:
             origins.append(normalized)
 
-# Remove duplicates and empty values while preserving order.
 origins = list(dict.fromkeys(
     origin for origin in origins if origin
 ))
@@ -236,9 +221,6 @@ print("CORS allowed origins:", origins)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    # Also allow local development ports and Render frontend subdomains.
-    # This is useful when the frontend runs on localhost:3000 while the
-    # backend is deployed on Render.
     allow_origin_regex=(
         r"^https://([a-zA-Z0-9-]+\.)?onrender\.com$"
         r"|^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
@@ -1179,7 +1161,7 @@ async def predict(
         )
 
     # --------------------------------------------------------
-    # GRAD-CAM
+    # GRAD-CAM (FIXED PARAMETER ORDER: image_path, model, output_path)
     # --------------------------------------------------------
 
     gradcam_error = None
@@ -1187,9 +1169,9 @@ async def predict(
     try:
 
         generate_gradcam(
-            model,
-            file_path,
-            gradcam_path,
+            image_path=file_path,
+            model=model,
+            output_path=gradcam_path,
         )
 
         if not os.path.exists(
@@ -1233,11 +1215,6 @@ async def predict(
     # --------------------------------------------------------
     # LIME
     # --------------------------------------------------------
-    # LIME is intentionally deferred from /predict.
-    # This prevents excessive memory usage on small
-    # Render instances.
-    #
-    # It can be generated using /explain/lime.
 
     lime_error = (
         "LIME generation deferred"
@@ -1336,7 +1313,7 @@ async def predict(
         )
 
     # --------------------------------------------------------
-    # RESPONSE
+    # RESPONSE & MEMORY CLEANUP
     # --------------------------------------------------------
 
     response = {
@@ -1400,6 +1377,8 @@ async def predict(
         response[
             "lime_error"
         ] = lime_error
+
+    gc.collect()
 
     return response
 
@@ -1494,10 +1473,6 @@ def delete_analysis(
             detail="Analysis not found",
         )
 
-    # --------------------------------------------------------
-    # DELETE ORIGINAL MRI
-    # --------------------------------------------------------
-
     if record.image_url:
 
         image_filename = (
@@ -1524,10 +1499,6 @@ def delete_analysis(
             except Exception:
                 pass
 
-    # --------------------------------------------------------
-    # DELETE GRAD-CAM
-    # --------------------------------------------------------
-
     if record.gradcam_url:
 
         gradcam_filename = (
@@ -1553,10 +1524,6 @@ def delete_analysis(
                 )
             except Exception:
                 pass
-
-    # --------------------------------------------------------
-    # DELETE LIME
-    # --------------------------------------------------------
 
     if record.lime_url:
 
@@ -1689,10 +1656,6 @@ def get_lime_explain(
         "analysis_id"
     )
 
-    # --------------------------------------------------------
-    # FIND ANALYSIS
-    # --------------------------------------------------------
-
     if analysis_id:
 
         record = (
@@ -1731,10 +1694,6 @@ def get_lime_explain(
             ),
         )
 
-    # --------------------------------------------------------
-    # FIND ORIGINAL IMAGE
-    # --------------------------------------------------------
-
     if not record.image_url:
 
         raise HTTPException(
@@ -1770,10 +1729,6 @@ def get_lime_explain(
             ),
         )
 
-    # --------------------------------------------------------
-    # LIME OUTPUT
-    # --------------------------------------------------------
-
     lime_filename = (
         f"lime_{image_filename}"
     )
@@ -1782,10 +1737,6 @@ def get_lime_explain(
         UPLOAD_DIR,
         lime_filename,
     )
-
-    # --------------------------------------------------------
-    # LOAD MODEL
-    # --------------------------------------------------------
 
     try:
 
@@ -1801,10 +1752,6 @@ def get_lime_explain(
             ),
         )
 
-    # --------------------------------------------------------
-    # GENERATE LIME
-    # --------------------------------------------------------
-
     try:
 
         result = generate_lime_explanation(
@@ -1812,10 +1759,6 @@ def get_lime_explain(
             image_path,
             lime_path,
         )
-
-        # Some implementations return
-        # a path while others simply
-        # create the file.
 
         if isinstance(
             result,
@@ -1872,10 +1815,6 @@ def get_lime_explain(
             ),
         )
 
-    # --------------------------------------------------------
-    # UPDATE DATABASE
-    # --------------------------------------------------------
-
     record.lime_url = (
         f"/uploads/{lime_filename}"
     )
@@ -1884,6 +1823,8 @@ def get_lime_explain(
     db.refresh(
         record
     )
+
+    gc.collect()
 
     return {
 
@@ -1923,7 +1864,7 @@ def get_reports(
 
 
 # ============================================================
-# PDF REPORT GENERATOR
+# PDF REPORT GENERATOR (MEMORY OPTIMIZED)
 # ============================================================
 
 def generate_pdf_report(
@@ -1949,10 +1890,6 @@ def generate_pdf_report(
         ParagraphStyle,
     )
 
-    # --------------------------------------------------------
-    # DOCUMENT
-    # --------------------------------------------------------
-
     doc = SimpleDocTemplate(
         pdf_path,
         pagesize=letter,
@@ -1962,23 +1899,14 @@ def generate_pdf_report(
         bottomMargin=36,
     )
 
-    styles = (
-        getSampleStyleSheet()
-    )
-
+    styles = getSampleStyleSheet()
     story = []
-
-    # --------------------------------------------------------
-    # STYLES
-    # --------------------------------------------------------
 
     title_style = ParagraphStyle(
         "DocTitle",
         parent=styles["Heading1"],
         fontSize=18,
-        textColor=colors.HexColor(
-            "#0284c7"
-        ),
+        textColor=colors.HexColor("#0284c7"),
         spaceAfter=12,
     )
 
@@ -1986,9 +1914,7 @@ def generate_pdf_report(
         "Section",
         parent=styles["Heading2"],
         fontSize=13,
-        textColor=colors.HexColor(
-            "#0f172a"
-        ),
+        textColor=colors.HexColor("#0f172a"),
         spaceBefore=8,
         spaceAfter=6,
     )
@@ -1998,9 +1924,7 @@ def generate_pdf_report(
         parent=styles["BodyText"],
         fontSize=9.5,
         leading=14,
-        textColor=colors.HexColor(
-            "#334155"
-        ),
+        textColor=colors.HexColor("#334155"),
         spaceAfter=8,
     )
 
@@ -2009,9 +1933,7 @@ def generate_pdf_report(
         parent=styles["BodyText"],
         fontSize=9.5,
         leading=14,
-        textColor=colors.HexColor(
-            "#1e293b"
-        ),
+        textColor=colors.HexColor("#1e293b"),
         leftIndent=8,
         spaceAfter=6,
     )
@@ -2021,901 +1943,152 @@ def generate_pdf_report(
         parent=styles["Italic"],
         fontSize=8,
         leading=11,
-        textColor=colors.HexColor(
-            "#64748b"
-        ),
-    )
-
-    # --------------------------------------------------------
-    # TITLE
-    # --------------------------------------------------------
-
-    story.append(
-        Paragraph(
-            "MEDXAI CLINICAL MRI RESEARCH REPORT",
-            title_style,
-        )
+        textColor=colors.HexColor("#64748b"),
     )
 
     story.append(
-        Spacer(1, 10)
+        Paragraph("MEDXAI CLINICAL MRI RESEARCH REPORT", title_style)
     )
+    story.append(Spacer(1, 10))
 
-    # --------------------------------------------------------
-    # PROBABILITIES
-    # --------------------------------------------------------
-
-    probabilities = (
-        analysis.probabilities
-        or {}
-    )
-
-    if isinstance(
-        probabilities,
-        str,
-    ):
-
+    probabilities = analysis.probabilities or {}
+    if isinstance(probabilities, str):
         try:
-
-            probabilities = (
-                json.loads(
-                    probabilities
-                )
-            )
-
+            probabilities = json.loads(probabilities)
         except Exception:
-
             probabilities = {}
 
     probability_items = []
-
-    if isinstance(
-        probabilities,
-        dict,
-    ):
-
-        for key, value in (
-            probabilities.items()
-        ):
-
+    if isinstance(probabilities, dict):
+        for key, value in probabilities.items():
             try:
-
-                numeric_value = float(
-                    value
-                )
-
+                numeric_value = float(value)
                 if numeric_value > 1:
-
                     numeric_value /= 100
-
             except Exception:
-
                 numeric_value = 0.0
 
-            probability_items.append(
-                (
-                    str(key),
-                    numeric_value,
-                )
-            )
+            probability_items.append((str(key), numeric_value))
 
-    probability_items.sort(
-        key=lambda item: item[1],
-        reverse=True,
-    )
+    probability_items.sort(key=lambda item: item[1], reverse=True)
 
-    # --------------------------------------------------------
-    # PREDICTION
-    # --------------------------------------------------------
-
-    prediction = str(
-        getattr(
-            analysis,
-            "prediction",
-            "Unknown",
-        )
-    )
+    prediction = str(getattr(analysis, "prediction", "Unknown"))
 
     try:
-
-        confidence = float(
-            getattr(
-                analysis,
-                "confidence_percentage",
-                0,
-            )
-            or 0
-        )
-
+        confidence = float(getattr(analysis, "confidence_percentage", 0) or 0)
     except Exception:
-
         confidence = 0.0
 
-    # --------------------------------------------------------
-    # REPORT INFORMATION
-    # --------------------------------------------------------
-
     info_data = [
-
-        [
-            Paragraph(
-                "<b>Report ID:</b>",
-                styles["Normal"],
-            ),
-
-            Paragraph(
-                str(report_id),
-                styles["Normal"],
-            ),
-        ],
-
-        [
-            Paragraph(
-                "<b>Date/Time:</b>",
-                styles["Normal"],
-            ),
-
-            Paragraph(
-                str(
-                    getattr(
-                        analysis,
-                        "created_at",
-                        "",
-                    )
-                ),
-                styles["Normal"],
-            ),
-        ],
-
-        [
-            Paragraph(
-                "<b>Scan Filename:</b>",
-                styles["Normal"],
-            ),
-
-            Paragraph(
-                str(
-                    getattr(
-                        analysis,
-                        "filename",
-                        "",
-                    )
-                ),
-                styles["Normal"],
-            ),
-        ],
-
-        [
-            Paragraph(
-                "<b>Diagnosis Classification:</b>",
-                styles["Normal"],
-            ),
-
-            Paragraph(
-                f"<b>{prediction}</b>",
-                styles["Normal"],
-            ),
-        ],
-
-        [
-            Paragraph(
-                "<b>Model Confidence:</b>",
-                styles["Normal"],
-            ),
-
-            Paragraph(
-                f"{confidence:.2f}%",
-                styles["Normal"],
-            ),
-        ],
+        [Paragraph("<b>Report ID:</b>", styles["Normal"]), Paragraph(str(report_id), styles["Normal"])],
+        [Paragraph("<b>Date/Time:</b>", styles["Normal"]), Paragraph(str(getattr(analysis, "created_at", "")), styles["Normal"])],
+        [Paragraph("<b>Scan Filename:</b>", styles["Normal"]), Paragraph(str(getattr(analysis, "filename", "")), styles["Normal"])],
+        [Paragraph("<b>Diagnosis Classification:</b>", styles["Normal"]), Paragraph(f"<b>{prediction}</b>", styles["Normal"])],
+        [Paragraph("<b>Model Confidence:</b>", styles["Normal"]), Paragraph(f"{confidence:.2f}%", styles["Normal"])],
     ]
 
-    info_table = Table(
-        info_data,
-        colWidths=[
-            160,
-            380,
-        ],
-    )
-
+    info_table = Table(info_data, colWidths=[160, 380])
     info_table.setStyle(
-        TableStyle(
-            [
-
-                (
-                    "BACKGROUND",
-                    (0, 0),
-                    (-1, -1),
-                    colors.HexColor(
-                        "#f8fafc"
-                    ),
-                ),
-
-                (
-                    "GRID",
-                    (0, 0),
-                    (-1, -1),
-                    0.5,
-                    colors.HexColor(
-                        "#cbd5e1"
-                    ),
-                ),
-
-                (
-                    "PADDING",
-                    (0, 0),
-                    (-1, -1),
-                    6,
-                ),
-
-                (
-                    "VALIGN",
-                    (0, 0),
-                    (-1, -1),
-                    "TOP",
-                ),
-            ]
-        )
+        TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f8fafc")),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+            ("PADDING", (0, 0), (-1, -1), 6),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ])
     )
 
-    story.append(
-        info_table
-    )
+    story.append(info_table)
+    story.append(Spacer(1, 15))
 
-    story.append(
-        Spacer(1, 15)
-    )
-
-    # --------------------------------------------------------
-    # PREDICTION SUMMARY
-    # --------------------------------------------------------
-
-    story.append(
-        Paragraph(
-            "AI Prediction Summary",
-            section_style,
-        )
-    )
+    story.append(Paragraph("AI Prediction Summary", section_style))
 
     if confidence >= 80:
-
-        confidence_description = (
-            "The model produced a "
-            "high-confidence classification "
-            "for the submitted MRI image."
-        )
-
+        confidence_description = "The model produced a high-confidence classification for the submitted MRI image."
     elif confidence >= 60:
-
-        confidence_description = (
-            "The model produced a "
-            "moderate-to-high confidence "
-            "classification. The result should "
-            "be interpreted together with the "
-            "probability distribution and "
-            "explainability outputs."
-        )
-
+        confidence_description = "The model produced a moderate-to-high confidence classification."
     elif confidence >= 40:
-
-        confidence_description = (
-            "The model produced an "
-            "intermediate-confidence "
-            "classification. The probability "
-            "distribution indicates that "
-            "alternative classes should also "
-            "be considered."
-        )
-
+        confidence_description = "The model produced an intermediate-confidence classification."
     else:
-
-        confidence_description = (
-            "The model produced a relatively "
-            "low-confidence classification, "
-            "indicating substantial uncertainty "
-            "in the prediction."
-        )
+        confidence_description = "The model produced a low-confidence classification."
 
     prediction_text = (
-        "The MEDXAI EfficientNetB0 model "
-        "classified the submitted MRI image "
-        f"as <b>{prediction}</b> with a model "
-        f"confidence of <b>{confidence:.2f}%</b>. "
+        f"The MEDXAI EfficientNetB0 model classified the submitted MRI image "
+        f"as <b>{prediction}</b> with a model confidence of <b>{confidence:.2f}%</b>. "
         f"{confidence_description}"
     )
 
-    story.append(
-        Paragraph(
-            prediction_text,
-            explanation_style,
-        )
-    )
+    story.append(Paragraph(prediction_text, explanation_style))
 
-    # --------------------------------------------------------
-    # PROBABILITY ANALYSIS
-    # --------------------------------------------------------
+    story.append(Paragraph("Class Probability Breakdown", section_style))
 
-    story.append(
-        Paragraph(
-            "Probability Analysis",
-            section_style,
-        )
-    )
+    probability_table_data = [["Class", "Probability"]]
+    for key, value in probability_items:
+        probability_table_data.append([str(key), f"{value * 100:.2f}%"])
 
-    if probability_items:
+    if len(probability_table_data) == 1:
+        probability_table_data.append(["Unavailable", "0.00%"])
 
-        top_class, top_probability = (
-            probability_items[0]
-        )
-
-        probability_text = (
-            "The highest model probability "
-            "is associated with "
-            f"<b>{top_class}</b> at "
-            f"<b>{top_probability * 100:.2f}%</b>. "
-        )
-
-        if len(
-            probability_items
-        ) > 1:
-
-            second_class, second_probability = (
-                probability_items[1]
-            )
-
-            difference = (
-                top_probability
-                - second_probability
-            )
-
-            probability_text += (
-                "The next highest probability "
-                f"is <b>{second_class}</b> at "
-                f"<b>{second_probability * 100:.2f}%</b>, "
-                "giving a probability difference "
-                f"of <b>{difference * 100:.2f} "
-                "percentage points</b>. "
-            )
-
-            if difference >= 0.30:
-
-                probability_text += (
-                    "This indicates a comparatively "
-                    "strong separation between the "
-                    "leading class and the next "
-                    "most likely class."
-                )
-
-            elif difference >= 0.10:
-
-                probability_text += (
-                    "This indicates a noticeable "
-                    "but not decisive separation "
-                    "between the leading classes."
-                )
-
-            else:
-
-                probability_text += (
-                    "The relatively small separation "
-                    "indicates that the model has "
-                    "meaningful uncertainty between "
-                    "the leading classes."
-                )
-
-    else:
-
-        probability_text = (
-            "A probability distribution was "
-            "not available for detailed "
-            "class comparison."
-        )
-
-    story.append(
-        Paragraph(
-            probability_text,
-            explanation_style,
-        )
-    )
-
-    # --------------------------------------------------------
-    # PROBABILITY TABLE
-    # --------------------------------------------------------
-
-    story.append(
-        Paragraph(
-            "Class Probability Breakdown",
-            section_style,
-        )
-    )
-
-    probability_table_data = [
-        [
-            "Class",
-            "Probability",
-        ]
-    ]
-
-    for key, value in (
-        probability_items
-    ):
-
-        probability_table_data.append(
-            [
-                str(key),
-                f"{value * 100:.2f}%",
-            ]
-        )
-
-    if len(
-        probability_table_data
-    ) == 1:
-
-        probability_table_data.append(
-            [
-                "Unavailable",
-                "0.00%",
-            ]
-        )
-
-    probability_table = Table(
-        probability_table_data,
-        colWidths=[
-            300,
-            240,
-        ],
-    )
-
+    probability_table = Table(probability_table_data, colWidths=[300, 240])
     probability_table.setStyle(
-        TableStyle(
-            [
-
-                (
-                    "BACKGROUND",
-                    (0, 0),
-                    (-1, 0),
-                    colors.HexColor(
-                        "#0284c7"
-                    ),
-                ),
-
-                (
-                    "TEXTCOLOR",
-                    (0, 0),
-                    (-1, 0),
-                    colors.white,
-                ),
-
-                (
-                    "GRID",
-                    (0, 0),
-                    (-1, -1),
-                    0.5,
-                    colors.HexColor(
-                        "#e2e8f0"
-                    ),
-                ),
-
-                (
-                    "PADDING",
-                    (0, 0),
-                    (-1, -1),
-                    6,
-                ),
-
-                (
-                    "VALIGN",
-                    (0, 0),
-                    (-1, -1),
-                    "MIDDLE",
-                ),
-            ]
-        )
+        TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0284c7")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+            ("PADDING", (0, 0), (-1, -1), 6),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ])
     )
 
-    story.append(
-        probability_table
-    )
+    story.append(probability_table)
+    story.append(Spacer(1, 15))
 
-    story.append(
-        Spacer(1, 15)
-    )
+    # Add Original MRI
+    image_rel = getattr(analysis, "image_url", "")
+    if image_rel and image_rel.startswith("/uploads/"):
+        image_filename = image_rel.replace("/uploads/", "")
+        image_full_path = os.path.join(UPLOAD_DIR, image_filename)
 
-    # --------------------------------------------------------
-    # ORIGINAL MRI
-    # --------------------------------------------------------
+        if os.path.exists(image_full_path):
+            story.append(Paragraph("Original MRI Scan", section_style))
+            story.append(Spacer(1, 5))
+            story.append(RLImage(image_full_path, width=180, height=180))
+            story.append(Spacer(1, 15))
 
-    image_rel = getattr(
-        analysis,
-        "image_url",
-        "",
-    )
+    # Add Grad-CAM
+    gradcam_rel = getattr(analysis, "gradcam_url", "")
+    if gradcam_rel and gradcam_rel.startswith("/uploads/"):
+        gradcam_filename = gradcam_rel.replace("/uploads/", "")
+        gradcam_full_path = os.path.join(UPLOAD_DIR, gradcam_filename)
 
-    if (
-        image_rel
-        and image_rel.startswith(
-            "/uploads/"
-        )
-    ):
+        if os.path.exists(gradcam_full_path) and os.path.getsize(gradcam_full_path) > 100:
+            story.append(Paragraph("Grad-CAM Explainability Heatmap", section_style))
+            story.append(Spacer(1, 5))
+            story.append(RLImage(gradcam_full_path, width=180, height=180))
+            story.append(Spacer(1, 15))
 
-        image_filename = (
-            image_rel.replace(
-                "/uploads/",
-                "",
-            )
-        )
+    # Add LIME
+    lime_rel = getattr(analysis, "lime_url", "")
+    if lime_rel and lime_rel.startswith("/uploads/"):
+        lime_filename = lime_rel.replace("/uploads/", "")
+        lime_full_path = os.path.join(UPLOAD_DIR, lime_filename)
 
-        image_full_path = os.path.join(
-            UPLOAD_DIR,
-            image_filename,
-        )
-
-        if os.path.exists(
-            image_full_path
-        ):
-
-            story.append(
-                Paragraph(
-                    "Original MRI Scan",
-                    section_style,
-                )
-            )
-
-            story.append(
-                Spacer(1, 5)
-            )
-
-            story.append(
-                RLImage(
-                    image_full_path,
-                    width=200,
-                    height=200,
-                )
-            )
-
-            story.append(
-                Spacer(1, 15)
-            )
-
-    # --------------------------------------------------------
-    # GRAD-CAM
-    # --------------------------------------------------------
-
-    gradcam_rel = getattr(
-        analysis,
-        "gradcam_url",
-        "",
-    )
-
-    gradcam_available = False
-
-    if (
-        gradcam_rel
-        and gradcam_rel.startswith(
-            "/uploads/"
-        )
-    ):
-
-        gradcam_filename = (
-            gradcam_rel.replace(
-                "/uploads/",
-                "",
-            )
-        )
-
-        gradcam_full_path = os.path.join(
-            UPLOAD_DIR,
-            gradcam_filename,
-        )
-
-        if (
-            os.path.exists(
-                gradcam_full_path
-            )
-            and os.path.getsize(
-                gradcam_full_path
-            ) > 100
-        ):
-
-            gradcam_available = True
-
-            story.append(
-                Paragraph(
-                    "Grad-CAM Explainability Heatmap",
-                    section_style,
-                )
-            )
-
-            story.append(
-                Spacer(1, 5)
-            )
-
-            story.append(
-                RLImage(
-                    gradcam_full_path,
-                    width=200,
-                    height=200,
-                )
-            )
-
-            story.append(
-                Spacer(1, 8)
-            )
-
-            story.append(
-                Paragraph(
-                    (
-                        "The Grad-CAM visualization "
-                        "provides a model-focused "
-                        "representation of the image "
-                        "regions that contributed most "
-                        "strongly to the "
-                        f"<b>{prediction}</b> "
-                        "classification. Highlighted "
-                        "regions should be interpreted "
-                        "as areas receiving greater "
-                        "influence from the neural "
-                        "network rather than as "
-                        "definitive evidence of disease."
-                    ),
-                    explanation_style,
-                )
-            )
-
-            story.append(
-                Spacer(1, 10)
-            )
-
-    # --------------------------------------------------------
-    # LIME
-    # --------------------------------------------------------
-
-    lime_rel = getattr(
-        analysis,
-        "lime_url",
-        "",
-    )
-
-    lime_available = False
-
-    if (
-        lime_rel
-        and lime_rel.startswith(
-            "/uploads/"
-        )
-    ):
-
-        lime_filename = (
-            lime_rel.replace(
-                "/uploads/",
-                "",
-            )
-        )
-
-        lime_full_path = os.path.join(
-            UPLOAD_DIR,
-            lime_filename,
-        )
-
-        if (
-            os.path.exists(
-                lime_full_path
-            )
-            and os.path.getsize(
-                lime_full_path
-            ) > 100
-        ):
-
-            lime_available = True
-
-            story.append(
-                Paragraph(
-                    "LIME Local Explanation",
-                    section_style,
-                )
-            )
-
-            story.append(
-                Spacer(1, 5)
-            )
-
-            story.append(
-                RLImage(
-                    lime_full_path,
-                    width=200,
-                    height=200,
-                )
-            )
-
-            story.append(
-                Spacer(1, 8)
-            )
-
-            story.append(
-                Paragraph(
-                    (
-                        "The LIME visualization "
-                        "provides a local explanation "
-                        "of the model decision by "
-                        "identifying image regions "
-                        "that contributed to the "
-                        "prediction for this individual "
-                        "MRI. These regions describe "
-                        "the behavior of the AI model "
-                        "and should not be interpreted "
-                        "as a direct anatomical diagnosis."
-                    ),
-                    explanation_style,
-                )
-            )
-
-            story.append(
-                Spacer(1, 10)
-            )
-
-    # --------------------------------------------------------
-    # OVERALL FINDINGS
-    # --------------------------------------------------------
+        if os.path.exists(lime_full_path) and os.path.getsize(lime_full_path) > 100:
+            story.append(Paragraph("LIME Local Explanation", section_style))
+            story.append(Spacer(1, 5))
+            story.append(RLImage(lime_full_path, width=180, height=180))
+            story.append(Spacer(1, 15))
 
     story.append(
         Paragraph(
-            "Overall AI Findings",
-            section_style,
-        )
-    )
-
-    if (
-        gradcam_available
-        and lime_available
-    ):
-
-        explanation_status = (
-            "Both Grad-CAM and LIME "
-            "explainability outputs were "
-            "successfully generated."
-        )
-
-    elif gradcam_available:
-
-        explanation_status = (
-            "Grad-CAM was successfully "
-            "generated, while a usable "
-            "LIME visualization was not "
-            "available."
-        )
-
-    elif lime_available:
-
-        explanation_status = (
-            "LIME was successfully "
-            "generated, while a usable "
-            "Grad-CAM visualization was "
-            "not available."
-        )
-
-    else:
-
-        explanation_status = (
-            "Neither Grad-CAM nor LIME "
-            "produced a usable "
-            "visualization for this analysis."
-        )
-
-    overall_text = (
-        "The overall MEDXAI analysis "
-        f"classified the MRI as "
-        f"<b>{prediction}</b> with a "
-        f"confidence of <b>{confidence:.2f}%</b>. "
-        f"{explanation_status} "
-        "The probability distribution "
-        "describes how the model allocated "
-        "prediction likelihood across the "
-        "available classes, while Grad-CAM "
-        "and LIME provide complementary "
-        "views of the model's decision "
-        "process. These explainability "
-        "methods describe model behavior "
-        "and do not independently establish "
-        "the presence, absence, severity, "
-        "or stage of Alzheimer's disease."
-    )
-
-    story.append(
-        Paragraph(
-            overall_text,
-            explanation_style,
-        )
-    )
-
-    # --------------------------------------------------------
-    # FINDINGS
-    # --------------------------------------------------------
-
-    if probability_items:
-
-        top_class, top_probability = (
-            probability_items[0]
-        )
-
-        story.append(
-            Paragraph(
-                "• Leading classification: "
-                f"<b>{top_class}</b>",
-                finding_style,
-            )
-        )
-
-        story.append(
-            Paragraph(
-                "• Leading probability: "
-                f"<b>{top_probability * 100:.2f}%</b>",
-                finding_style,
-            )
-        )
-
-        story.append(
-            Paragraph(
-                "• Reported model confidence: "
-                f"<b>{confidence:.2f}%</b>",
-                finding_style,
-            )
-        )
-
-    story.append(
-        Paragraph(
-            (
-                "• Explainability interpretation: "
-                "highlighted regions represent "
-                "areas that influenced the AI "
-                "model's decision and should not "
-                "be treated as independently "
-                "diagnostic."
-            ),
-            finding_style,
-        )
-    )
-
-    # --------------------------------------------------------
-    # DISCLAIMER
-    # --------------------------------------------------------
-
-    story.append(
-        Spacer(1, 10)
-    )
-
-    story.append(
-        Paragraph(
-            (
-                "<b>MEDICAL DISCLAIMER:</b> "
-                "This AI-generated report is "
-                "produced by the MEDXAI "
-                "EfficientNetB0 Engine for "
-                "research and clinical "
-                "decision-support purposes. "
-                "The prediction, probability "
-                "values, Grad-CAM visualization, "
-                "and LIME explanation describe "
-                "the behavior of an artificial "
-                "intelligence model and are not "
-                "a medical diagnosis. This report "
-                "must be reviewed by a qualified "
-                "radiologist, neurologist, or "
-                "other appropriately qualified "
-                "healthcare professional before "
-                "any clinical diagnosis or "
-                "treatment decision is made."
-            ),
+            "<b>MEDICAL DISCLAIMER:</b> This AI-generated report is produced by "
+            "the MEDXAI EfficientNetB0 Engine for research and decision support. "
+            "It must be reviewed by a qualified healthcare professional.",
             disclaimer_style,
         )
     )
 
-    # --------------------------------------------------------
-    # BUILD PDF
-    # --------------------------------------------------------
-
-    doc.build(
-        story
-    )
+    doc.build(story)
+    gc.collect()
 
 
 # ============================================================
@@ -3055,6 +2228,8 @@ def create_report(
             ),
         )
 
+    gc.collect()
+
     return {
 
         "id": report_obj.id,
@@ -3074,7 +2249,7 @@ def create_report(
         "download_url": (
             f"/reports/"
             f"{report_obj.id}"
-            f"/download"
+            f"{'/download'}"
         ),
 
         "created_at": (
